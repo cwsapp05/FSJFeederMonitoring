@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FSJ Feeder Monitoring</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}?v={{ asset_version('style.css') }}">
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <span class="brand-mark" aria-hidden="true"></span>
+    <span class="brand-name">FSJ Feeder Monitoring</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab-btn active" data-tab="upload" role="tab">Upload</button>
+    <button class="tab-btn" data-tab="library" role="tab">Library</button>
+    <button class="tab-btn" data-tab="timeline" role="tab">Timeline</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ============================== UPLOAD ============================== -->
+  <section id="tab-upload" class="tab-panel active">
+    <div class="upload-grid">
+      <div class="card">
+        <h2>Upload photos</h2>
+        <p class="muted">Pick a folder of photos from one feeder position (e.g. one SD-card download).
+          They're uploaded, then run through MegaDetector + SpeciesNet. Date, time and camera name are read
+          from each photo's info bar.</p>
+        <div class="field-row">
+          <label class="file-pick">
+            <input type="file" id="folder-input" webkitdirectory directory multiple hidden>
+            <span class="secondary-btn">Choose folder…</span>
+          </label>
+          <label class="file-pick">
+            <input type="file" id="files-input" accept="image/*" multiple hidden>
+            <span class="ghost-btn">or choose photos…</span>
+          </label>
+        </div>
+        <p id="pick-summary" class="pick-summary muted">No photos chosen.</p>
+        <div class="field-row">
+          <label for="position-select">Position</label>
+          <select id="position-select"><option value="">Choose…</option></select>
+        </div>
+        <div class="field-row">
+          <button id="start-upload-btn" class="primary-btn" disabled>Upload &amp; process</button>
+          <button id="cancel-upload-btn" class="ghost-btn hidden">Cancel upload</button>
+        </div>
+        <div id="upload-progress" class="progress hidden"><div class="progress-bar"></div><span class="progress-label"></span></div>
+        <p id="upload-error" class="error hidden"></p>
+      </div>
+
+      <div class="card">
+        <h2>Field Log</h2>
+        <p class="muted">Upload the Log workbook (.xlsx) whenever it changes. Each upload replaces the
+          previous one — Excel stays the master copy.</p>
+        <div class="field-row">
+          <label class="file-pick">
+            <input type="file" id="log-input" accept=".xlsx,.xlsm" hidden>
+            <span class="secondary-btn">Upload Log…</span>
+          </label>
+          <span id="log-uploading" class="muted hidden">Reading workbook…</span>
+        </div>
+        <p id="log-error" class="error hidden"></p>
+        <div id="log-summary" class="log-summary muted">No Log uploaded yet.</div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-head">
+        <h2>Processing queue</h2>
+        <span class="muted small">Jobs run one at a time.</span>
+      </div>
+      <div id="queue-list" class="queue-list"><p class="muted">Nothing processed yet.</p></div>
+    </div>
+  </section>
+
+  <!-- ============================== LIBRARY ============================= -->
+  <section id="tab-library" class="tab-panel">
+    <div id="library-groups-view">
+      <div class="view-head">
+        <h2>Library</h2>
+        <span id="library-total" class="muted"></span>
+      </div>
+      <div id="species-grid" class="species-grid"></div>
+    </div>
+
+    <div id="library-group-view" class="hidden">
+      <div class="view-head">
+        <button id="library-back" class="ghost-btn">← All species</button>
+        <h2 id="group-title"></h2>
+        <span id="group-count" class="muted"></span>
+      </div>
+      <div class="toolbar">
+        <label>Position <select id="group-position"><option value="">All</option></select></label>
+        <label>From <input type="date" id="group-start"></label>
+        <label>To <input type="date" id="group-end"></label>
+        <label>Sort
+          <select id="group-sort"><option value="newest">Newest first</option><option value="oldest">Oldest first</option></select>
+        </label>
+        <label class="check"><input type="checkbox" id="group-review"> Marked for review only</label>
+      </div>
+      <div id="image-grid" class="image-grid"></div>
+      <div class="load-more-row"><button id="load-more" class="secondary-btn hidden">Load more</button></div>
+    </div>
+  </section>
+
+  <!-- ============================== TIMELINE ============================ -->
+  <section id="tab-timeline" class="tab-panel">
+    <div class="toolbar timeline-toolbar">
+      <label>Zoom <input type="range" id="tl-zoom" min="0" max="100" value="20"></label>
+      <button id="tl-fit" class="ghost-btn">Fit all</button>
+      <label>Go to <input type="date" id="tl-goto"></label>
+      <label>Photos
+        <select id="tl-species"><option value="__nonblank">All except blank</option><option value="__all">All, incl. blank</option></select>
+      </label>
+      <span id="tl-status" class="muted small"></span>
+    </div>
+    <div id="tl-legend" class="legend"></div>
+    <div id="tl-empty" class="empty-state hidden">
+      Upload the Log and some photos on the Upload tab to see the timeline.
+    </div>
+    <div id="tl-scroller" class="tl-scroller">
+      <div id="tl-canvas" class="tl-canvas">
+        <div id="tl-axis" class="tl-axis"></div>
+        <div id="tl-rows" class="tl-rows"></div>
+      </div>
+    </div>
+    <p class="muted small tl-hint">Scroll sideways (Shift + wheel, or drag) to move through time; Ctrl + wheel zooms.
+      Zoomed out, each day shows photo counts per species; zoom in to see individual photos.</p>
+  </section>
+</main>
+
+<!-- ============================== MODALS ============================== -->
+<div id="viewer" class="modal hidden" role="dialog" aria-modal="true">
+  <div class="viewer-box">
+    <button class="modal-close" data-close aria-label="Close">×</button>
+    <div class="viewer-media">
+      <button class="nav-btn prev" id="viewer-prev" aria-label="Previous">‹</button>
+      <img id="viewer-img" alt="">
+      <button class="nav-btn next" id="viewer-next" aria-label="Next">›</button>
+    </div>
+    <aside class="viewer-panel">
+      <div class="viewer-species">
+        <div class="label-sm">Species</div>
+        <div id="v-species" class="species-name"></div>
+        <div id="v-ai" class="muted small"></div>
+        <div id="v-verified" class="muted small"></div>
+      </div>
+      <div class="edit-block">
+        <label for="v-correct">Correct species</label>
+        <div class="inline">
+          <input id="v-correct" list="species-datalist" placeholder="Search species…" autocomplete="off">
+          <button id="v-correct-save" class="secondary-btn">Set</button>
+        </div>
+        <button id="v-revert" class="link-btn hidden">Revert to AI tag</button>
+      </div>
+      <div class="edit-grid">
+        <label class="wide">Date &amp; time <input type="datetime-local" id="v-datetime"></label>
+        <label>Position <select id="v-position"></select></label>
+        <label>Count <input type="number" id="v-count" min="0"></label>
+        <label>Band ID <input type="text" id="v-band" placeholder="e.g. BA-GZT"></label>
+      </div>
+      <label class="block-label">Notes <textarea id="v-notes" rows="3"></textarea></label>
+      <label class="check"><input type="checkbox" id="v-review"> Marked for review</label>
+      <div class="meta-list small muted" id="v-meta"></div>
+      <div class="viewer-actions">
+        <button id="v-save" class="primary-btn">Save</button>
+        <button id="v-delete" class="danger-btn">Delete entry</button>
+      </div>
+      <p id="v-error" class="error hidden"></p>
+    </aside>
+  </div>
+</div>
+
+<div id="popover" class="popover hidden"></div>
+<datalist id="species-datalist"></datalist>
+
+<script src="{{ url_for('static', filename='script.js') }}?v={{ asset_version('script.js') }}"></script>
+</body>
+</html>

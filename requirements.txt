@@ -1,0 +1,28 @@
+# Web framework
+flask
+
+# Thumbnails + reading EXIF (app.py, cuddeback_ocr.py)
+pillow
+
+# OCR of the Cuddeback info bar (cuddeback_ocr.py). Also needs the Tesseract
+# OCR engine itself, a separate system install:
+#   macOS:   brew install tesseract
+#   Linux:   apt install tesseract-ocr
+#   Windows: https://github.com/UB-Mannheim/tesseract/wiki
+pytesseract
+
+# Reading the field Log workbook (log_import.py)
+openpyxl
+
+# Optional Dawn/Day/Dusk/Night label (only used if SITE_LAT/SITE_LON are set)
+astral
+
+# Detection + classification. app.py runs
+# `python -m megadetector.detection.run_md_and_speciesnet` as a subprocess,
+# so these must be installed in the same Python environment as app.py.
+speciesnet
+megadetector
+
+# Production servers — MUST run as a single process (see gunicorn.conf.py)
+gunicorn   # Linux/macOS
+waitress   # Windows (serve_windows.py)
