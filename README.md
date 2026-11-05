@@ -62,6 +62,8 @@ gunicorn -c gunicorn.conf.py wsgi:app      # production, Linux/macOS
 python serve_windows.py                    # production, Windows
 ```
 
+Then open http://localhost:5050. (Port 5050 keeps it clear of other apps on 5000; set `PORT` to change it.)
+
 > **Single process only.** The job worker starts when `app.py` is imported. A second process would run a second SpeciesNet job at the same time. See `gunicorn.conf.py`.
 
 ### Optional environment variables
@@ -72,7 +74,7 @@ python serve_windows.py                    # production, Windows
 | `SPECIESNET_COUNTRY` / `SPECIESNET_ADMIN1` | `USA` / `FL` | SpeciesNet geofencing; set the country to empty to disable |
 | `SITE_LAT` / `SITE_LON` | unset | If set, each photo gets a Dawn/Day/Dusk/Night label |
 | `TIMEZONE` | `America/New_York` | Used with the above |
-| `HOST` / `PORT` | `127.0.0.1` / `5000` | Server address (keep `127.0.0.1` — there is no sign-in) |
+| `HOST` / `PORT` | `127.0.0.1` / `5050` | Server address (keep `127.0.0.1` — there is no sign-in) |
 
 ## Storage
 

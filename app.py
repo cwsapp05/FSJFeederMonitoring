@@ -870,5 +870,5 @@ if __name__ == "__main__":
     # use_reloader=False: the reloader would import this module twice and
     # start two job workers. See the module docstring.
     app.run(host=os.environ.get("HOST", "127.0.0.1"),
-            port=int(os.environ.get("PORT", "5000")),
+            port=int(os.environ.get("PORT", "5050")),
             use_reloader=False, threaded=True)

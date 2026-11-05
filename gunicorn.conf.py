@@ -44,8 +44,8 @@ import os
 # port 5000 system-wide, which shows up as "Address already in use" even with
 # nothing of yours running. Either disable it (System Settings > General >
 # AirDrop & Handoff > AirPlay Receiver) or set PORT to something else.
-# To see what currently holds a port:  lsof -nP -iTCP:5000 -sTCP:LISTEN
-bind = f"{os.environ.get('HOST', '127.0.0.1')}:{os.environ.get('PORT', '5000')}"
+# To see what currently holds a port:  lsof -nP -iTCP:5050 -sTCP:LISTEN
+bind = f"{os.environ.get('HOST', '127.0.0.1')}:{os.environ.get('PORT', '5050')}"
 
 # ---------------------------------------------------------------------------
 # Worker processes — see the warning above before changing `workers`.

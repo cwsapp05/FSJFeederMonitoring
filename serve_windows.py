@@ -20,7 +20,7 @@ Environment:
                 Tunnel connects from this same machine. Do NOT set this to
                 0.0.0.0 unless you intend the app to be reachable from your
                 local network directly; the tunnel does not need it.
-    PORT        default 5000
+    PORT        default 5050
     THREADS     default 8
 """
 
@@ -32,7 +32,7 @@ from app import app
 
 if __name__ == "__main__":
     host = os.environ.get("HOST", "127.0.0.1")
-    port = int(os.environ.get("PORT", "5000"))
+    port = int(os.environ.get("PORT", "5050"))
     threads = int(os.environ.get("THREADS", "8"))
 
     print(f"Serving on http://{host}:{port}  (threads={threads})")
