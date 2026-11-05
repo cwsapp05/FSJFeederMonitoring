@@ -18,18 +18,15 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS jobs (
     id            TEXT PRIMARY KEY,
     seq           INTEGER NOT NULL,
-    batch_id      TEXT,
     display_name  TEXT,
-    position      INTEGER,
-    status        TEXT NOT NULL,          -- queued | running | syncing | done | error | cancelling | cancelled
+    status        TEXT NOT NULL,          -- queued | running | done | error | cancelling | cancelled
     created_at    TEXT,
     started_at    TEXT,
     finished_at   TEXT,
     folder        TEXT,
-    output_json   TEXT,
     log_file      TEXT,
-    cmd           TEXT,                   -- JSON list
-    file_count    INTEGER,
+    file_count    INTEGER,                -- photos this job set out to process
+    done_count    INTEGER DEFAULT 0,      -- how many of those are in the Library so far
     created_by    TEXT
 );
 
@@ -70,6 +67,24 @@ CREATE INDEX IF NOT EXISTS idx_images_species  ON images(display_species);
 CREATE INDEX IF NOT EXISTS idx_images_captured ON images(captured_at);
 CREATE INDEX IF NOT EXISTS idx_images_position ON images(position, captured_at);
 
+-- Photos deleted from the Library. The files stay in the workspace folder, so
+-- this keeps the next processing run from adding them back.
+CREATE TABLE IF NOT EXISTS dismissed_photos (
+    filename TEXT PRIMARY KEY
+);
+
+-- Human labels from the Camelot export, one row per sighting. A photo can have
+-- several. Replaced whenever the workspace's CSV is read.
+CREATE TABLE IF NOT EXISTS camelot_sightings (
+    stem        TEXT NOT NULL,            -- lowercase file name without extension
+    sighting_id TEXT NOT NULL,
+    species     TEXT NOT NULL,            -- e.g. "Florida Scrub-Jay", "Nothing Nothing"
+    quantity    INTEGER,
+    jay_id      TEXT,                     -- as typed in Camelot, e.g. "FZ-RAT, UNID"
+    life_stage  TEXT,
+    PRIMARY KEY (stem, sighting_id)
+);
+
 CREATE TABLE IF NOT EXISTS species (
     label TEXT PRIMARY KEY
 );
@@ -102,7 +117,12 @@ _db_path = None
 # columns to a table that already exists.)
 ADDED_COLUMNS = {
     "images": ["hardware_id TEXT", "battery TEXT", "battery_source TEXT", "trigger TEXT",
-               "camera_model TEXT", "firmware TEXT", "exif_comment TEXT"],
+               "camera_model TEXT", "firmware TEXT", "exif_comment TEXT",
+               "stem TEXT",                # lowercase file name without extension; joins camelot_sightings
+               "ai_is_group INTEGER DEFAULT 0",  # ai_species is a broad group ("bird"), not a species
+               "camelot_species TEXT",     # the photo's Camelot species, comma-separated
+               "camelot_agreement TEXT"],  # agree | group | differ | NULL = nothing to compare
+    "jobs": ["done_count INTEGER DEFAULT 0"],
 }
 
 
@@ -116,6 +136,7 @@ def init(path):
         for col in cols:
             if col.split()[0] not in have:
                 conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_images_stem ON images(stem)")
     conn.commit()
 
 

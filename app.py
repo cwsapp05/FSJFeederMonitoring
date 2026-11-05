@@ -4,11 +4,12 @@ FSJ Feeder Monitoring — Flask backend.
 Adapted from ArbCameraTrapCV (github.com/cwsapp05/ArbCameraTrapCV) for still
 photos from Cuddeback feeder cameras. Three tabs:
 
-  Upload    pick a folder of photos + the feeder position they came from;
-            they're chunk-uploaded to this server, queued, and run through
-            MegaDetector + SpeciesNet. Each photo's date/time, camera name and
-            other Cuddeback fields are read from its EXIF (cuddeback_exif.py).
-            The field Log workbook is uploaded here too.
+  Workspace choose the folder holding all the photos, plus the CSV that says
+            which station each photo came from. Photos stay where they are and
+            are run through MegaDetector + SpeciesNet in batches, so a long run
+            can stop and pick up where it left off. Each photo's date/time,
+            camera name and other Cuddeback fields are read from its EXIF
+            (cuddeback_exif.py). The field Log workbook is uploaded here too.
   Library   photos grouped by species, with correction, count, notes,
             band ID and review flag.
   Timeline  Log events (log_import.py) and photos laid out on a scrollable
@@ -17,9 +18,8 @@ photos from Cuddeback feeder cameras. Three tabs:
 Single-user, local app: there is no sign-in, and it listens on 127.0.0.1
 (this computer only) by default.
 
-Storage is SQLite (runs/fsj.db, see db.py) plus the uploaded photos and
-thumbnails under runs/. Photos are served from where they were uploaded and
-never copied again.
+Storage is SQLite (runs/fsj.db, see db.py) plus thumbnails under runs/. Photos
+are read and served from the workspace folder, and are never copied or changed.
 
 Run (development):  python app.py
 Run (production):   gunicorn -c gunicorn.conf.py wsgi:app   (Linux/macOS)
@@ -32,11 +32,11 @@ gunicorn.conf.py.
 """
 
 import collections
-import errno
+import csv
 import hashlib
 import json
 import os
-import shutil
+import re
 import subprocess
 import sys
 import threading
@@ -56,22 +56,37 @@ app = Flask(__name__)
 BASE_DIR = Path(__file__).parent.resolve()
 RUNS_DIR = BASE_DIR / "runs"
 RUNS_DIR.mkdir(exist_ok=True)
-UPLOADS_DIR = RUNS_DIR / "uploads"
-UPLOADS_DIR.mkdir(exist_ok=True)
 THUMBNAILS_DIR = RUNS_DIR / "thumbnails"
 THUMBNAILS_DIR.mkdir(exist_ok=True)
 JOBS_DIR = RUNS_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 LOG_DIR = RUNS_DIR / "log"
 LOG_DIR.mkdir(exist_ok=True)
-UPLOAD_BATCHES_FILE = RUNS_DIR / "upload_batches.json"
 
 db.init(RUNS_DIR / "fsj.db")
 
 PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".bmp"}
-CHUNK_SIZE = 8 * 1024 * 1024
-MAX_CHUNK_BYTES = CHUNK_SIZE * 2
 THUMBNAIL_MAX_EDGE = 480
+
+# Photos per pipeline run. Results are saved after each batch, so this is the
+# most work an interruption can lose. Each batch also reloads the models
+# (about 20 seconds on CPU).
+PROCESS_BATCH_SIZE = int(os.environ.get("PROCESS_BATCH_SIZE", "500"))
+
+# MegaDetector's own default output threshold, which the combined pipeline
+# also uses.
+DETECTOR_MODEL = "MDV5A"
+DETECTOR_OUTPUT_THRESHOLD = "0.005"
+
+# Columns of the Camelot export that say which station each photo came from.
+POSITION_FILE_COLUMN = "Media Filename"
+POSITION_STATION_COLUMN = "Trap Station Name"
+STATION_NUMBER_RE = re.compile(r"(\d+)\s*$")   # "WCP-13" -> position 13
+
+# Camelot's names that differ from SpeciesNet's for the same thing, in lowercase.
+CAMELOT_TO_AI = {"nothing nothing": "blank"}
+# Labels that don't say what's in the photo, so there's nothing to compare.
+CAMELOT_NOT_COMPARABLE = {"unknown sp"}
 
 # Default number of feeder positions when no Log has been uploaded yet.
 DEFAULT_POSITIONS = int(os.environ.get("NUM_POSITIONS", "25"))
@@ -89,7 +104,7 @@ SITE_TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 
 
 app.config.update(
-    MAX_CONTENT_LENGTH=64 * 1024 * 1024,  # per request; photos arrive in 8MB chunks
+    MAX_CONTENT_LENGTH=64 * 1024 * 1024,  # the Log workbook is the only upload
 )
 
 
@@ -126,130 +141,251 @@ def list_positions():
 
 
 # ===========================================================================
-# Chunked folder upload (from ArbCameraTrapCV, trimmed: no disk-space
-# preflight, no Empty Trash)
+# Workspace: the folder of photos the app works on, in place
+#
+# A photo's identity is its path relative to the workspace folder, so moving
+# the folder and choosing its new location keeps every result and correction.
+#
+# The routes that act on local paths use request.get_json() without force=True.
+# That rejects a plain cross-site form POST, so another website open in the
+# browser can't point this app at a different folder.
 # ===========================================================================
 
-upload_batches_lock = threading.Lock()
-upload_batches = json.loads(UPLOAD_BATCHES_FILE.read_text()) if UPLOAD_BATCHES_FILE.exists() else {}
+def scan_photos(folder):
+    """Workspace-relative paths (forward slashes) of every photo under folder."""
+    found = []
+    for dirpath, dirnames, filenames in os.walk(folder):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        rel_dir = Path(dirpath).relative_to(folder)
+        found += [(rel_dir / name).as_posix() for name in filenames
+                  if not name.startswith(".") and Path(name).suffix.lower() in PHOTO_EXTENSIONS]
+    return sorted(found)
 
 
-def save_upload_batches():
-    with upload_batches_lock:
-        data = json.dumps(upload_batches)
-    UPLOAD_BATCHES_FILE.write_text(data)
+def photo_stem(filename):
+    return Path(filename).stem.lower()
 
 
-def _sanitize_relpath(raw):
-    """A browser-supplied file name, reduced to a safe single path component.
-    Photos from one folder upload are stored flat in the batch directory."""
-    name = Path(str(raw or "").replace("\\", "/")).name
-    if not name or name in (".", "..") or name.startswith("."):
-        raise ValueError("Invalid file name")
-    if Path(name).suffix.lower() not in PHOTO_EXTENSIONS:
-        raise ValueError("Not a photo")
-    return name
+def _sighting_column(fieldnames, name):
+    """A CSV merged from an export and a paths file has two copies of some
+    columns. The plain Jay ID etc. are unreliable there: on a photo with several
+    sightings they repeat one sighting and lose the others. The "(paths file)"
+    copies have one correct row per Sighting ID and match the Camelot export."""
+    merged = f"{name} (paths file)"
+    return merged if merged in fieldnames else name
 
 
-@app.route("/api/uploads", methods=["POST"])
-def init_upload_batch():
-    """Body: {"files": [{"path", "size"}], "resume_batch_id"?}. Pre-sizes each
-    destination file so chunks can be written at their offsets in any order.
-    Returns {"batch_id", "received": {name: [chunk indexes already on disk]}}."""
-    data = request.get_json(force=True)
-    files = data.get("files") or []
-    if not files:
-        return jsonify({"error": "No photos to upload"}), 400
+def read_camelot_csv(csv_path):
+    """Returns (positions, sightings) from a Camelot export:
+    positions  {stem: position}. A photo listed under two different stations is
+               left out rather than guessed at.
+    sightings  {stem: [{sighting_id, species, quantity, jay_id, life_stage}]}.
+               Empty if the CSV has no label columns."""
+    positions, conflicting, by_stem = {}, set(), {}
+    with open(csv_path, encoding="utf-8-sig", errors="replace", newline="") as f:
+        reader = csv.DictReader(f)
+        fields = reader.fieldnames or []
+        missing = {POSITION_FILE_COLUMN, POSITION_STATION_COLUMN} - set(fields)
+        if missing:
+            raise ValueError(f"That CSV has no {' or '.join(sorted(missing))} column")
+        has_labels = "Species Common Name" in fields and "Sighting ID" in fields
+        quantity_col = _sighting_column(fields, "Sighting Quantity")
+        jay_col = _sighting_column(fields, "Jay ID")
+        life_col = _sighting_column(fields, "Life stage")
 
-    cleaned = []
-    for f in files:
-        try:
-            rel = _sanitize_relpath(f.get("path"))
-            size = int(f.get("size"))
-            if size < 0:
-                raise ValueError
-        except (ValueError, TypeError):
-            return jsonify({"error": f"Invalid file entry: {f.get('path')!r}"}), 400
-        cleaned.append((rel, size))
+        def cell(row, col):
+            value = (row.get(col) or "").strip()
+            return "" if value == "-" else value
 
-    resume_id = data.get("resume_batch_id")
-    with upload_batches_lock:
-        resumable = bool(resume_id and upload_batches.get(resume_id, {}).get("status") == "uploading")
-        batch_id = resume_id if resumable else uuid.uuid4().hex[:16]
-        if not resumable:
-            upload_batches[batch_id] = {"status": "uploading", "created_at": now_iso(), "files": {}}
-        manifest = upload_batches[batch_id]
-        batch_dir = UPLOADS_DIR / batch_id
-        batch_dir.mkdir(parents=True, exist_ok=True)
-        received = {}
-        for rel, size in cleaned:
-            existing = manifest["files"].get(rel)
-            if existing and existing["size"] == size:
-                received[rel] = existing["received_chunks"]
+        for row in reader:
+            stem = photo_stem(row[POSITION_FILE_COLUMN] or "")
+            if not stem:
                 continue
-            with open(batch_dir / rel, "wb") as fh:
-                fh.truncate(size)
-            manifest["files"][rel] = {"size": size, "expected_chunks": max(1, -(-size // CHUNK_SIZE)),
-                                      "received_chunks": []}
-            received[rel] = []
-    save_upload_batches()
-    return jsonify({"batch_id": batch_id, "received": received, "chunk_size": CHUNK_SIZE})
+            match = STATION_NUMBER_RE.search(row[POSITION_STATION_COLUMN] or "")
+            if match:
+                position = int(match.group(1))
+                if positions.setdefault(stem, position) != position:
+                    conflicting.add(stem)
+            species = cell(row, "Species Common Name") if has_labels else ""
+            sighting_id = cell(row, "Sighting ID") if has_labels else ""
+            if species and sighting_id:
+                quantity = cell(row, quantity_col)
+                # Keyed by Sighting ID because a merged CSV repeats each one.
+                by_stem.setdefault(stem, {})[sighting_id] = {
+                    "sighting_id": sighting_id, "species": species,
+                    "quantity": int(quantity) if quantity.isdigit() else None,
+                    "jay_id": cell(row, jay_col), "life_stage": cell(row, life_col),
+                }
+    for stem in conflicting:
+        del positions[stem]
+    if not positions:
+        raise ValueError("That CSV has no rows with both a file name and a station number")
+    return positions, {stem: list(rows.values()) for stem, rows in by_stem.items()}
 
 
-@app.route("/api/uploads/<batch_id>/chunk", methods=["POST"])
-def upload_chunk(batch_id):
-    with upload_batches_lock:
-        manifest = upload_batches.get(batch_id)
-        if not manifest or manifest["status"] != "uploading":
-            return jsonify({"error": "Unknown or already-submitted upload"}), 404
-        try:
-            rel = _sanitize_relpath(request.form.get("path"))
-            chunk_index = int(request.form.get("chunk_index"))
-        except (ValueError, TypeError):
-            return jsonify({"error": "Invalid chunk metadata"}), 400
-        entry = manifest["files"].get(rel)
-        if entry is None or not (0 <= chunk_index < entry["expected_chunks"]):
-            return jsonify({"error": "Unexpected chunk"}), 400
+def position_for(filename, positions):
+    return positions.get(photo_stem(filename))
 
-    chunk = request.files.get("chunk")
-    if chunk is None:
-        return jsonify({"error": "Missing chunk data"}), 400
-    payload = chunk.read(MAX_CHUNK_BYTES + 1)
-    if len(payload) > MAX_CHUNK_BYTES:
-        return jsonify({"error": "Chunk too large"}), 400
+
+def camelot_agreement(sightings, ai_species, ai_is_group):
+    """How the AI's label compares with a photo's Camelot sightings: "agree",
+    "group" (the AI only gave a broad group like "bird", which isn't checked
+    against the species), "differ", or None if there's nothing to compare."""
+    labels = {CAMELOT_TO_AI.get(s["species"].lower(), s["species"].lower()) for s in sightings}
+    labels -= CAMELOT_NOT_COMPARABLE
+    if not labels:
+        return None
+    ai = (ai_species or "blank").lower()
+    if ai in labels or ("crow sp." in labels and ai.endswith(" crow")):
+        return "agree"
+    # A broad animal group can't be right about a photo that people marked as
+    # empty or as a person.
+    return "group" if ai_is_group and labels - {"blank", "human"} else "differ"
+
+
+def camelot_fields(filename, ai_species, ai_is_group, sightings_by_stem):
+    """What one photo's Camelot sightings add to its record."""
+    sightings = sightings_by_stem.get(photo_stem(filename), [])
+    return {
+        "camelot_species": ", ".join(dict.fromkeys(s["species"] for s in sightings)) or None,
+        "camelot_agreement": camelot_agreement(sightings, ai_species, ai_is_group),
+        "jay_ids": ", ".join(dict.fromkeys(s["jay_id"] for s in sightings if s["jay_id"])),
+    }
+
+
+def pending_photos(folder):
+    """Photos in the folder that aren't in the Library yet (and weren't deleted
+    from it)."""
+    known = {r["filename"] for r in db.query("SELECT filename FROM images")}
+    known |= {r["filename"] for r in db.query("SELECT filename FROM dismissed_photos")}
+    return [p for p in scan_photos(folder) if p not in known]
+
+
+def has_active_job():
+    return db.query_one("SELECT 1 AS x FROM jobs WHERE status IN ('queued', 'running', 'cancelling') LIMIT 1") is not None
+
+
+def workspace_state():
+    state = {"folder": None, "active": has_active_job()}
+    workspace = get_kv("workspace")
+    if workspace:
+        processed = db.query_one("SELECT COUNT(*) AS n FROM images")["n"]
+        dismissed = db.query_one("SELECT COUNT(*) AS n FROM dismissed_photos")["n"]
+        state.update(workspace, processed=processed,
+                     pending=max(0, workspace["photo_count"] - processed - dismissed))
+    return state
+
+
+@app.route("/api/workspace")
+def get_workspace():
+    return jsonify(workspace_state())
+
+
+@app.route("/api/workspace", methods=["POST"])
+def set_workspace():
+    """Body: {"folder", "positions_csv"}. Also the way to pick up photos added
+    to the folder, a moved folder, or a newer export."""
+    if has_active_job():
+        return jsonify({"error": "Wait for processing to finish, or cancel it, before changing the workspace"}), 409
+    data = request.get_json()
+    # Windows' "Copy as path" wraps the path in quotes.
+    folder_raw = (data.get("folder") or "").strip().strip('"')
+    csv_raw = (data.get("positions_csv") or "").strip().strip('"')
+    if not folder_raw:
+        return jsonify({"error": "Choose the photo folder"}), 400
+    if not csv_raw:
+        return jsonify({"error": "Choose the position CSV"}), 400
+    folder = Path(folder_raw).expanduser().resolve()
+    csv_path = Path(csv_raw).expanduser().resolve()
+    if not folder.is_dir():
+        return jsonify({"error": f"Folder not found: {folder}"}), 400
+    if not csv_path.is_file():
+        return jsonify({"error": f"CSV not found: {csv_path}"}), 400
+
     try:
-        with open(UPLOADS_DIR / batch_id / rel, "r+b") as fh:
-            fh.seek(chunk_index * CHUNK_SIZE)
-            fh.write(payload)
-    except OSError as e:
-        if e.errno == errno.ENOSPC:
-            return jsonify({"error": "The server ran out of disk space.", "code": "insufficient_storage"}), 507
-        raise
+        positions, sightings = read_camelot_csv(csv_path)
+    except (OSError, ValueError) as e:
+        return jsonify({"error": str(e)}), 400
+    photos = scan_photos(folder)
+    if not photos:
+        return jsonify({"error": f"No photos found in {folder}"}), 400
 
-    with upload_batches_lock:
-        if chunk_index not in entry["received_chunks"]:
-            entry["received_chunks"].append(chunk_index)
-        manifest["updated_at"] = now_iso()
-    save_upload_batches()
-    return jsonify({"ok": True})
+    # Filenames are the photos' identity, so a different set of photos must not
+    # be matched against results from this one.
+    previous = get_kv("workspace")
+    if previous and Path(previous["folder"]) != folder:
+        on_disk = set(photos)
+        missing = sum(1 for r in db.query("SELECT filename FROM images") if r["filename"] not in on_disk)
+        if missing:
+            return jsonify({"error": f"{missing:,} photos already in the Library aren't in that folder. "
+                                     "Choose a folder that contains them."}), 400
+
+    workspace = {
+        "folder": str(folder),
+        "positions_csv": str(csv_path),
+        "photo_count": len(photos),
+        "not_in_csv": sum(1 for p in photos if position_for(p, positions) is None),
+        "with_labels": sum(1 for p in photos if photo_stem(p) in sightings),
+        "set_at": now_iso(),
+    }
+    unassigned = db.query("SELECT id, filename FROM images WHERE position IS NULL")
+    existing = db.query("SELECT id, filename, ai_species, ai_is_group FROM images")
+    with db.transaction() as conn:
+        conn.execute("UPDATE images SET folder = ?", (str(folder),))
+        conn.executemany("UPDATE images SET position = ? WHERE id = ?",
+                         [(position_for(r["filename"], positions), r["id"]) for r in unassigned])
+        conn.execute("DELETE FROM camelot_sightings")
+        conn.executemany(
+            """INSERT INTO camelot_sightings(stem, sighting_id, species, quantity, jay_id, life_stage)
+               VALUES(?, ?, ?, ?, ?, ?)""",
+            [(stem, s["sighting_id"], s["species"], s["quantity"], s["jay_id"], s["life_stage"])
+             for stem, rows in sightings.items() for s in rows])
+        # Photos processed before this CSV. A Band ID someone typed is left alone.
+        for r in existing:
+            fields = camelot_fields(r["filename"], r["ai_species"], r["ai_is_group"], sightings)
+            conn.execute(
+                """UPDATE images SET stem = ?, camelot_species = ?, camelot_agreement = ?,
+                       band_id = COALESCE(NULLIF(band_id, ''), ?) WHERE id = ?""",
+                (photo_stem(r["filename"]), fields["camelot_species"], fields["camelot_agreement"],
+                 fields["jay_ids"], r["id"]))
+        set_kv(conn, "workspace", workspace)
+    return jsonify(workspace_state())
 
 
-@app.route("/api/uploads/<batch_id>", methods=["DELETE"])
-def delete_upload_batch(batch_id):
-    with upload_batches_lock:
-        manifest = upload_batches.get(batch_id)
-        if manifest is None:
-            return jsonify({"deleted": batch_id})
-        if manifest["status"] != "uploading":
-            return jsonify({"error": "Already submitted — cancel the job instead"}), 400
-        del upload_batches[batch_id]
-    save_upload_batches()
-    shutil.rmtree(UPLOADS_DIR / batch_id, ignore_errors=True)
-    return jsonify({"deleted": batch_id})
+# Runs as its own process: Tk needs its own main thread, which a web request
+# thread can't provide.
+_PICKER_SCRIPT = """
+import sys, tkinter
+from tkinter import filedialog
+root = tkinter.Tk()
+root.withdraw()
+root.attributes("-topmost", True)
+if sys.argv[1] == "folder":
+    path = filedialog.askdirectory(title="Choose the folder containing the photos")
+else:
+    path = filedialog.askopenfilename(title="Choose the position CSV",
+                                      filetypes=[("CSV files", "*.csv"), ("All files", "*.*")])
+sys.stdout.write(path or "")
+"""
+
+
+@app.route("/api/workspace/browse", methods=["POST"])
+def browse_for_path():
+    """Opens a native file dialog on this computer (the app only runs locally).
+    Body: {"kind": "folder" | "csv"}. Returns {"path"}, null if cancelled."""
+    kind = "folder" if request.get_json().get("kind") == "folder" else "csv"
+    try:
+        result = subprocess.run([sys.executable, "-c", _PICKER_SCRIPT, kind], capture_output=True,
+                                encoding="utf-8", timeout=600, env={**os.environ, "PYTHONUTF8": "1"})
+    except (OSError, subprocess.TimeoutExpired):
+        result = None
+    if result is None or result.returncode != 0:
+        return jsonify({"error": "Couldn't open a file dialog. Paste the path into the box instead."}), 500
+    return jsonify({"path": os.path.normpath(result.stdout) if result.stdout else None})
 
 
 # ===========================================================================
-# Job queue (single worker thread, one SpeciesNet run at a time)
+# Job queue (single worker thread, one pipeline run at a time)
 # ===========================================================================
 
 job_queue = collections.deque()
@@ -267,53 +403,31 @@ def _set_job(job_id, **fields):
     db.execute(f"UPDATE jobs SET {cols} WHERE id = ?", (*fields.values(), job_id))
 
 
-@app.route("/api/run", methods=["POST"])
-def run_job():
-    data = request.get_json(force=True)
-    batch_id = (data.get("batch_id") or "").strip()
-    display_name = (data.get("folder_name") or "").strip()
-    try:
-        position = int(data.get("position"))
-    except (TypeError, ValueError):
-        return jsonify({"error": "Choose the position these photos came from"}), 400
+@app.route("/api/workspace/process", methods=["POST"])
+def process_workspace():
+    """Queues a job for every photo not in the Library yet, so this both starts
+    a run and resumes a cancelled or failed one."""
+    request.get_json()
+    workspace = get_kv("workspace")
+    if not workspace:
+        return jsonify({"error": "Choose a workspace folder first"}), 400
+    if has_active_job():
+        return jsonify({"error": "Already processing"}), 409
+    if not Path(workspace["folder"]).is_dir():
+        return jsonify({"error": f"Folder not found: {workspace['folder']}"}), 400
+    file_count = len(pending_photos(workspace["folder"]))
+    if not file_count:
+        return jsonify({"error": "Every photo in the workspace has already been processed"}), 400
 
-    with upload_batches_lock:
-        manifest = upload_batches.get(batch_id)
-        if manifest is None:
-            return jsonify({"error": "Unknown upload"}), 400
-        if manifest["status"] != "uploading":
-            return jsonify({"error": f"This upload is already {manifest['status']}"}), 400
-        incomplete = sum(1 for f in manifest["files"].values()
-                         if len(f["received_chunks"]) < f["expected_chunks"])
-        file_count = len(manifest["files"])
-    if incomplete:
-        return jsonify({"error": f"{incomplete} file(s) not fully uploaded yet"}), 400
-
-    folder = UPLOADS_DIR / batch_id
     job_id = uuid.uuid4().hex[:12]
     job_dir = JOBS_DIR / job_id
     job_dir.mkdir(parents=True, exist_ok=True)
-    output_json = job_dir / "predictions.json"
-    log_file = job_dir / "log.txt"
-
-    cmd = [sys.executable, "-m", "megadetector.detection.run_md_and_speciesnet",
-           str(folder), str(output_json), "--skip_video"]
-    if SPECIESNET_COUNTRY:
-        cmd += ["--country", SPECIESNET_COUNTRY]
-        if SPECIESNET_ADMIN1:
-            cmd += ["--admin1_region", SPECIESNET_ADMIN1]
-
     seq = (db.query_one("SELECT COALESCE(MAX(seq), 0) AS s FROM jobs")["s"] or 0) + 1
     db.execute(
-        """INSERT INTO jobs(id, seq, batch_id, display_name, position, status, created_at, folder,
-                            output_json, log_file, cmd, file_count, created_by)
-           VALUES(?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
-        (job_id, seq, batch_id, display_name or batch_id, position, now_iso(), str(folder),
-         str(output_json), str(log_file), json.dumps(cmd), file_count, None))
-
-    with upload_batches_lock:
-        upload_batches[batch_id]["status"] = "processing"
-    save_upload_batches()
+        """INSERT INTO jobs(id, seq, display_name, status, created_at, folder, log_file, file_count, done_count)
+           VALUES(?, ?, ?, 'queued', ?, ?, ?, ?, 0)""",
+        (job_id, seq, Path(workspace["folder"]).name, now_iso(), workspace["folder"],
+         str(job_dir / "log.txt"), file_count))
 
     with queue_cv:
         job_queue.append(job_id)
@@ -342,48 +456,98 @@ def _execute_job(job_id):
     job = _job(job_id)
     if not job or job["status"] != "queued":
         return
-    _set_job(job_id, status="running", started_at=now_iso())
-    cmd = json.loads(job["cmd"])
-    log_path = Path(job["log_file"])
+    # Keep the first start time when a job resumes after a restart.
+    _set_job(job_id, status="running", started_at=job["started_at"] or now_iso())
+    folder = job["folder"]
 
-    try:
-        with open(log_path, "w") as log:
-            log.write("Running: " + " ".join(cmd) + "\n\n")
+    with open(job["log_file"], "a", encoding="utf-8") as log:
+        positions, sightings = read_camelot_csv(get_kv("workspace")["positions_csv"])
+        # Worked out here rather than when the job was queued, so a job that was
+        # interrupted by a restart continues with what's left.
+        pending = pending_photos(folder)
+        log.write(f"{len(pending):,} photos to process, in batches of {PROCESS_BATCH_SIZE}.\n")
+        log.flush()
+        for start in range(0, len(pending), PROCESS_BATCH_SIZE):
+            if _is_cancelling(job_id):
+                break
+            batch = pending[start:start + PROCESS_BATCH_SIZE]
+            log.write(f"\n=== Photos {start + 1:,}-{start + len(batch):,} of {len(pending):,} ===\n")
             log.flush()
-            proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT)
-            with running_processes_lock:
-                running_processes[job_id] = proc
-            returncode = proc.wait()
-    except Exception as e:
-        returncode = -1
-        with open(log_path, "a") as log:
-            log.write(f"\nCould not run SpeciesNet: {e}\n")
-    finally:
-        with running_processes_lock:
-            running_processes.pop(job_id, None)
+            predictions = _run_pipeline(job_id, folder, batch, log)
+            if _is_cancelling(job_id):
+                break
+            if predictions is None:
+                log.write("\nStopped. Photos finished so far are saved; "
+                          "press Process to retry the rest.\n")
+                _set_job(job_id, status="error", finished_at=now_iso())
+                return
+            sync_batch(job_id, folder, predictions, positions, sightings, log)
 
-    if _job(job_id)["status"] == "cancelling":
-        _set_job(job_id, status="cancelled", finished_at=now_iso())
-        _cleanup_batch(job)
-        return
-    if returncode != 0:
-        _set_job(job_id, status="error", finished_at=now_iso())
-        return
-
-    _set_job(job_id, status="syncing")
-    with open(log_path, "a") as log:
-        sync_images_from_job(job_id, log)
+        if _is_cancelling(job_id):
+            log.write("\nCancelled. Photos finished so far are saved.\n")
+            _set_job(job_id, status="cancelled", finished_at=now_iso())
+            return
+        left = len(pending_photos(folder))
+        if left:
+            log.write(f"\n{left:,} photo(s) couldn't be processed. Press Process to retry them.\n")
+        log.write("Done.\n")
     _set_job(job_id, status="done", finished_at=now_iso())
 
 
-def _cleanup_batch(job):
-    batch_id = job.get("batch_id")
-    if not batch_id:
-        return
-    with upload_batches_lock:
-        upload_batches.pop(batch_id, None)
-    save_upload_batches()
-    shutil.rmtree(UPLOADS_DIR / batch_id, ignore_errors=True)
+def _is_cancelling(job_id):
+    return _job(job_id)["status"] == "cancelling"
+
+
+def _run_pipeline(job_id, folder, batch, log):
+    """Runs MegaDetector, then SpeciesNet on its detections. The combined
+    pipeline command can only take a whole folder, while the detector can take
+    a list of files, which is what lets the photos stay in one folder. Returns
+    the predictions file, or None if a step failed or was cancelled."""
+    job_dir = Path(_job(job_id)["log_file"]).parent
+    file_list = job_dir / "batch_files.json"
+    detections = job_dir / "batch_detections.json"
+    # Numbered by progress, so each batch's raw results are kept and a retried
+    # batch overwrites its own failed attempt.
+    predictions = job_dir / f"predictions-{_job(job_id)['done_count']:06d}.json"
+    file_list.write_text(json.dumps([Path(folder, p).as_posix() for p in batch]), encoding="utf-8")
+
+    detect = [sys.executable, "-m", "megadetector.detection.run_detector_batch", DETECTOR_MODEL,
+              str(file_list), str(detections), "--threshold", DETECTOR_OUTPUT_THRESHOLD, "--quiet"]
+    classify = [sys.executable, "-m", "megadetector.detection.run_md_and_speciesnet",
+                folder, str(predictions), "--detections_file", str(detections), "--skip_video"]
+    if SPECIESNET_COUNTRY:
+        classify += ["--country", SPECIESNET_COUNTRY]
+        if SPECIESNET_ADMIN1:
+            classify += ["--admin1_region", SPECIESNET_ADMIN1]
+
+    try:
+        if _run_step(job_id, detect, log) and not _is_cancelling(job_id) and _run_step(job_id, classify, log):
+            return predictions
+        return None
+    finally:
+        file_list.unlink(missing_ok=True)
+        detections.unlink(missing_ok=True)
+
+
+def _run_step(job_id, cmd, log):
+    log.write("Running: " + " ".join(cmd) + "\n\n")
+    log.flush()
+    try:
+        proc = subprocess.Popen(cmd, stdout=log, stderr=subprocess.STDOUT,
+                                env={**os.environ, "PYTHONIOENCODING": "utf-8"})
+    except OSError as e:
+        log.write(f"\nCould not start the pipeline: {e}\n")
+        return False
+    with running_processes_lock:
+        running_processes[job_id] = proc
+    try:
+        # Covers a cancel that arrived just before the process was registered.
+        if _is_cancelling(job_id):
+            _terminate_then_kill(proc)
+        return proc.wait() == 0
+    finally:
+        with running_processes_lock:
+            running_processes.pop(job_id, None)
 
 
 def _terminate_then_kill(proc):
@@ -408,7 +572,6 @@ def cancel_job(job_id):
             except ValueError:
                 pass
         _set_job(job_id, status="cancelled", finished_at=now_iso())
-        _cleanup_batch(job)
     elif job["status"] == "running":
         _set_job(job_id, status="cancelling")
         with running_processes_lock:
@@ -436,9 +599,9 @@ def get_queue():
     jobs = db.query("SELECT * FROM jobs ORDER BY seq DESC LIMIT 50")
     out = []
     for j in jobs:
-        item = {k: j[k] for k in ("id", "display_name", "position", "status", "created_at",
-                                  "started_at", "finished_at", "file_count", "created_by")}
-        if j["status"] in ("running", "syncing", "cancelling"):
+        item = {k: j[k] for k in ("id", "display_name", "status", "created_at", "started_at",
+                                  "finished_at", "file_count", "done_count", "created_by")}
+        if j["status"] in ("running", "cancelling"):
             item["log_tail"] = _log_tail(j["log_file"])
         out.append(item)
     return jsonify(out)
@@ -454,8 +617,9 @@ def job_log(job_id):
 
 def _restore_queue_on_startup():
     """Queued jobs survive restarts. A job that was mid-run when the server
-    stopped is re-queued from the start (its SpeciesNet run was lost)."""
-    db.execute("UPDATE jobs SET status = 'queued' WHERE status IN ('running', 'syncing')")
+    stopped is re-queued, and continues with the photos not yet in the Library
+    (only the batch in progress is lost)."""
+    db.execute("UPDATE jobs SET status = 'queued' WHERE status = 'running'")
     db.execute("UPDATE jobs SET status = 'cancelled' WHERE status = 'cancelling'")
     for j in db.query("SELECT id FROM jobs WHERE status = 'queued' ORDER BY seq"):
         job_queue.append(j["id"])
@@ -465,8 +629,8 @@ def _restore_queue_on_startup():
 # Turning predictions.json into image records
 # ===========================================================================
 
-def image_id_for(job_id, filename):
-    return hashlib.sha1(f"{job_id}:{filename}".encode()).hexdigest()[:16]
+def image_id_for(filename):
+    return hashlib.sha1(filename.encode()).hexdigest()[:16]
 
 
 def compute_diel_period(captured_at):
@@ -522,29 +686,47 @@ def _best_species(dets, class_cats):
     return best[0], best[1], best[2], labels.count(best[0])
 
 
-def sync_images_from_job(job_id, log):
-    job = _job(job_id)
-    output_json = Path(job["output_json"])
-    if not output_json.exists():
-        log.write("\nNo predictions.json was produced.\n")
-        return
-    data = json.loads(output_json.read_text())
+def _group_labels(data):
+    """Labels in a predictions file that are a broad group rather than a species.
+    Their taxonomy, "id;class;order;family;genus;species;common name", has no
+    species. "blank" and "vehicle" have none either, but aren't animal groups."""
+    labels = data.get("classification_categories", {})
+    groups = set()
+    for category, description in data.get("classification_category_descriptions", {}).items():
+        parts = description.split(";")
+        label = labels.get(category)
+        if len(parts) == 7 and not parts[5] and label not in ("blank", "vehicle"):
+            groups.add(label)
+    return groups
+
+
+def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
+    """Adds one batch's results to the Library and counts them on the job."""
+    data = json.loads(predictions_file.read_text(encoding="utf-8"))
     class_cats = data.get("classification_categories", {})
+    group_labels = _group_labels(data)
 
     with db.transaction() as conn:
         conn.executemany("INSERT OR IGNORE INTO species(label) VALUES(?)",
                          [(label,) for label in class_cats.values()])
 
-    folder = Path(job["folder"])
+    folder = Path(folder)
     entries = data.get("images", [])
     log.write(f"\nReading metadata and making thumbnails for {len(entries)} photos...\n")
     log.flush()
 
-    undated = 0
-    for i, img in enumerate(entries, 1):
-        filename = img.get("file", "")
+    undated = failed = 0
+    for img in entries:
+        # A photo the detector couldn't read (a damaged file, a drive that went
+        # away) isn't blank. Leaving it out means the next run retries it.
+        if img.get("failure"):
+            failed += 1
+            log.write(f"  Couldn't read {img.get('file')}: {img['failure']}\n")
+            continue
+        # The file list gave the detector absolute paths.
+        filename = Path(os.path.relpath(folder / img.get("file", ""), folder)).as_posix()
         path = folder / filename
-        image_id = image_id_for(job_id, filename)
+        image_id = image_id_for(filename)
         ai_species, ai_conf, ai_det_conf, ai_count = _best_species(img.get("detections") or [], class_cats)
         meta = cuddeback_exif.read_photo_metadata(path)
         has_thumb = make_thumbnail(path, image_id)
@@ -562,31 +744,36 @@ def sync_images_from_job(job_id, log):
 
         exif_cols = ("camera_id", "image_seq", "hardware_id", "battery", "battery_source",
                      "trigger", "camera_model", "firmware", "exif_comment")
-        cols = ("id", "job_id", "folder", "filename", "position", *exif_cols,
-                "captured_at", "time_source", "diel_period", "ai_species", "ai_conf", "ai_det_conf",
+        ai_is_group = int(ai_species in group_labels)
+        camelot = camelot_fields(filename, ai_species, ai_is_group, sightings)
+        cols = ("id", "job_id", "folder", "filename", "stem", "position", *exif_cols,
+                "captured_at", "time_source", "diel_period", "ai_species", "ai_is_group", "ai_conf", "ai_det_conf",
+                "camelot_species", "camelot_agreement", "band_id",
                 "display_species", "count", "has_thumbnail", "created_at")
-        values = (image_id, job_id, str(folder), filename, job["position"],
+        values = (image_id, job_id, str(folder), filename, photo_stem(filename), position_for(filename, positions),
                   *(meta[c] for c in exif_cols),
-                  captured_at, time_source, compute_diel_period(captured_at), ai_species,
+                  captured_at, time_source, compute_diel_period(captured_at), ai_species, ai_is_group,
                   round(ai_conf, 3) if ai_conf is not None else None,
                   round(ai_det_conf, 3) if ai_det_conf is not None else None,
+                  camelot["camelot_species"], camelot["camelot_agreement"], camelot["jay_ids"],
                   display, ai_count, int(has_thumb), now_iso())
         # On reprocessing, refresh machine-derived fields only; human edits
         # (corrections, count, notes, band ID, review flag) are left alone.
-        refresh = (*exif_cols, "captured_at", "time_source", "diel_period", "ai_species", "ai_conf",
-                   "ai_det_conf", "display_species", "has_thumbnail")
+        refresh = (*exif_cols, "captured_at", "time_source", "diel_period", "ai_species", "ai_is_group",
+                   "ai_conf", "ai_det_conf", "camelot_species", "camelot_agreement", "display_species",
+                   "has_thumbnail")
         with db.transaction() as conn:
             conn.execute(
                 f"""INSERT INTO images({", ".join(cols)}) VALUES({", ".join("?" * len(cols))})
                     ON CONFLICT(id) DO UPDATE SET {", ".join(f"{c} = excluded.{c}" for c in refresh)}""",
                 values)
-        if i % 100 == 0 or i == len(entries):
-            log.write(f"  {i}/{len(entries)}\n")
-            log.flush()
     if undated:
         log.write(f"{undated} photo(s) had no EXIF capture time (not original camera files?) "
                   "and won't appear on the Timeline until dated by hand in the Library.\n")
-    log.write("Done.\n")
+    done = _job(job_id)["done_count"] + len(entries) - failed
+    _set_job(job_id, done_count=done)
+    log.write(f"{done:,} of {_job(job_id)['file_count']:,} photos finished.\n")
+    log.flush()
 
 
 # ===========================================================================
@@ -598,7 +785,7 @@ IMAGE_PUBLIC_FIELDS = (
     "diel_period", "ai_species", "ai_conf", "ai_det_conf", "corrected_species", "corrected_by",
     "corrected_at", "display_species", "count", "notes", "band_id", "marked_for_review",
     "metadata_edited", "has_thumbnail", "hardware_id", "battery", "battery_source", "trigger",
-    "camera_model", "firmware", "exif_comment",
+    "camera_model", "firmware", "exif_comment", "camelot_species", "camelot_agreement",
 )
 
 
@@ -633,11 +820,18 @@ def species_taxonomy():
 
 @app.route("/api/images")
 def list_images():
-    """Query params: species, position, review=1, start/end (YYYY-MM-DD),
-    sort=newest|oldest, offset, limit."""
+    """Query params: species, camelot_species, agreement=agree|group|differ|none,
+    position, review=1, start/end (YYYY-MM-DD), sort=newest|oldest, offset, limit."""
     where, params = [], []
     if request.args.get("species"):
         where.append("display_species = ?"); params.append(request.args["species"])
+    if request.args.get("camelot_species"):
+        where.append("EXISTS (SELECT 1 FROM camelot_sightings s WHERE s.stem = images.stem AND s.species = ?)")
+        params.append(request.args["camelot_species"])
+    if request.args.get("agreement") == "none":
+        where.append("camelot_agreement IS NULL")
+    elif request.args.get("agreement"):
+        where.append("camelot_agreement = ?"); params.append(request.args["agreement"])
     if request.args.get("position"):
         where.append("position = ?"); params.append(int(request.args["position"]))
     if request.args.get("review") in ("1", "true"):
@@ -672,7 +866,35 @@ def _get_image_or_404(image_id):
 
 @app.route("/api/images/<image_id>")
 def get_image(image_id):
-    return jsonify(public_image(_get_image_or_404(image_id)))
+    r = _get_image_or_404(image_id)
+    sightings = db.query("SELECT species, quantity, jay_id, life_stage FROM camelot_sightings "
+                         "WHERE stem = ? ORDER BY sighting_id", (r["stem"],))
+    return jsonify({**public_image(r), "camelot_sightings": sightings})
+
+
+@app.route("/api/camelot/compare")
+def camelot_compare():
+    """Library photos per Camelot species, by how the AI's label compares. A
+    photo with sightings of two species counts under both."""
+    species = {}
+    for r in db.query(
+            """SELECT s.species, i.camelot_agreement AS agreement,
+                      COALESCE(i.ai_species, 'blank') AS ai, COUNT(DISTINCT i.id) AS n
+               FROM images i JOIN camelot_sightings s ON s.stem = i.stem
+               GROUP BY s.species, agreement, ai"""):
+        row = species.setdefault(r["species"], {"species": r["species"], "agree": 0, "group": 0, "differ": 0,
+                                                "total": 0, "called": collections.Counter()})
+        row["total"] += r["n"]
+        if r["agreement"]:
+            row[r["agreement"]] += r["n"]
+        if r["agreement"] == "differ":
+            row["called"][r["ai"]] += r["n"]
+    rows = sorted(species.values(), key=lambda row: -row["total"])
+    for row in rows:
+        row["called"] = [label for label, _ in row["called"].most_common(3)]
+    totals = {r["agreement"] or "none": r["n"] for r in db.query(
+        "SELECT camelot_agreement AS agreement, COUNT(*) AS n FROM images GROUP BY camelot_agreement")}
+    return jsonify({"species": rows, "totals": totals})
 
 
 @app.route("/api/images/<image_id>/correct", methods=["POST"])
@@ -735,10 +957,12 @@ def update_image(image_id):
 
 @app.route("/api/images/<image_id>/delete", methods=["POST"])
 def delete_image(image_id):
-    """Removes the library record and its thumbnail. The uploaded photo file
-    itself stays on disk (same as ArbCameraTrapCV's single-entry delete)."""
-    _get_image_or_404(image_id)
-    db.execute("DELETE FROM images WHERE id = ?", (image_id,))
+    """Removes the library record and its thumbnail. The photo file itself stays
+    in the workspace folder, and later runs won't add it back."""
+    r = _get_image_or_404(image_id)
+    with db.transaction() as conn:
+        conn.execute("DELETE FROM images WHERE id = ?", (image_id,))
+        conn.execute("INSERT OR IGNORE INTO dismissed_photos(filename) VALUES(?)", (r["filename"],))
     (THUMBNAILS_DIR / f"{image_id}.jpg").unlink(missing_ok=True)
     return jsonify({"deleted": image_id})
 
@@ -746,9 +970,7 @@ def delete_image(image_id):
 @app.route("/media/<image_id>")
 def serve_media(image_id):
     r = _get_image_or_404(image_id)
-    folder = Path(r["folder"]).resolve()
-    if UPLOADS_DIR.resolve() not in folder.parents and folder != UPLOADS_DIR.resolve():
-        abort(404)
+    folder = Path(r["folder"])
     if not (folder / r["filename"]).is_file():
         abort(404)
     return send_from_directory(str(folder), r["filename"], max_age=86400)
@@ -816,6 +1038,7 @@ def timeline_range():
         "end": max(ends) if ends else today,
         "positions": known_positions(),
         "undated_images": db.query_one("SELECT COUNT(*) AS n FROM images WHERE captured_at IS NULL")["n"],
+        "unassigned_images": db.query_one("SELECT COUNT(*) AS n FROM images WHERE position IS NULL")["n"],
     })
 
 

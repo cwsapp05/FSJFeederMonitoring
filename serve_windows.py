@@ -7,10 +7,8 @@ alternative and, conveniently, matches this app's hard requirement exactly:
 ONE process, with threads for concurrency.
 
 That single-process constraint is not a preference. app.py starts the
-background job-queue worker at import time and keeps the upload manifest
-in memory, so a second process would run a second copy of the
-queue and diverge from the first. See gunicorn.conf.py for the full
-explanation.
+background job-queue worker at import time, so a second process would run a
+second copy of the queue. See gunicorn.conf.py for the full explanation.
 
 Run:
     python serve_windows.py

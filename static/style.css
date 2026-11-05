@@ -76,9 +76,18 @@ label { font-size: .9rem; }
   padding: 18px; box-shadow: var(--shadow); margin-bottom: 18px;
 }
 .card-head { display: flex; align-items: baseline; gap: 12px; }
-.upload-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
-@media (max-width: 900px) { .upload-grid { grid-template-columns: 1fr; } }
+.workspace-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
+@media (max-width: 900px) { .workspace-grid { grid-template-columns: 1fr; } }
 .field-row { display: flex; align-items: center; gap: 10px; margin: 10px 0; flex-wrap: wrap; }
+.path-field { display: block; margin-top: 12px; font-weight: 600; font-size: .9rem; }
+.path-row { display: flex; align-items: center; gap: 8px; margin-top: 4px; }
+.path-row input { flex: 1; min-width: 0; }
+.compare-card { margin-top: 18px; }
+.compare-scroll { overflow-x: auto; }
+.compare-table { width: 100%; border-collapse: collapse; font-size: .9rem; }
+.compare-table th { text-align: left; font-weight: 600; white-space: nowrap; }
+.compare-table th, .compare-table td { padding: 6px 12px 6px 0; border-bottom: 1px solid var(--border); }
+.compare-table .num { text-align: right; font-variant-numeric: tabular-nums; }
 .pick-summary { font-size: .9rem; }
 .progress { position: relative; height: 22px; background: var(--surface-2); border-radius: 6px; overflow: hidden;
   border: 1px solid var(--border); }
@@ -94,7 +103,7 @@ label { font-size: .9rem; }
 .job-head { display: flex; gap: 12px; align-items: center; flex-wrap: wrap; }
 .job-name { font-weight: 600; }
 .status-pill { font-size: .75rem; padding: 2px 8px; border-radius: 99px; background: #e6e3da; text-transform: capitalize; }
-.status-pill.running, .status-pill.syncing { background: #dce8f6; color: var(--accent); }
+.status-pill.running { background: #dce8f6; color: var(--accent); }
 .status-pill.done { background: #dfeedd; color: var(--green); }
 .status-pill.error, .status-pill.cancelled { background: #f6e1dc; color: var(--danger); }
 .job pre { max-height: 220px; overflow: auto; background: #1f231d; color: #dfe6d8; font-size: .75rem;

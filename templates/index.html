@@ -13,42 +13,40 @@
     <span class="brand-name">FSJ Feeder Monitoring</span>
   </div>
   <nav class="tabs" role="tablist">
-    <button class="tab-btn active" data-tab="upload" role="tab">Upload</button>
+    <button class="tab-btn active" data-tab="workspace" role="tab">Workspace</button>
     <button class="tab-btn" data-tab="library" role="tab">Library</button>
     <button class="tab-btn" data-tab="timeline" role="tab">Timeline</button>
   </nav>
 </header>
 
 <main>
-  <!-- ============================== UPLOAD ============================== -->
-  <section id="tab-upload" class="tab-panel active">
-    <div class="upload-grid">
+  <!-- ============================= WORKSPACE ============================ -->
+  <section id="tab-workspace" class="tab-panel active">
+    <div class="workspace-grid">
       <div class="card">
-        <h2>Upload photos</h2>
-        <p class="muted">Pick a folder of photos from one feeder position (e.g. one SD-card download).
-          They're uploaded, then run through MegaDetector + SpeciesNet. Date, time and camera name are read
-          from each photo's EXIF, so upload the original files from the SD card.</p>
-        <div class="field-row">
-          <label class="file-pick">
-            <input type="file" id="folder-input" webkitdirectory directory multiple hidden>
-            <span class="secondary-btn">Choose folder…</span>
-          </label>
-          <label class="file-pick">
-            <input type="file" id="files-input" accept="image/*" multiple hidden>
-            <span class="ghost-btn">or choose photos…</span>
-          </label>
+        <h2>Photo workspace</h2>
+        <p class="muted">Choose the folder holding your photos, including any subfolders. Photos stay where they
+          are and aren't copied or changed. Keep the original camera files, since date, time and camera name are read
+          from each photo's EXIF.</p>
+        <label class="path-field" for="ws-folder">Photo folder</label>
+        <div class="path-row">
+          <input type="text" id="ws-folder" spellcheck="false" autocomplete="off" placeholder="Paste a path or browse">
+          <button class="secondary-btn" data-browse="folder" data-target="ws-folder">Browse…</button>
         </div>
-        <p id="pick-summary" class="pick-summary muted">No photos chosen.</p>
-        <div class="field-row">
-          <label for="position-select">Position</label>
-          <select id="position-select"><option value="">Choose…</option></select>
+        <label class="path-field" for="ws-csv">Position CSV</label>
+        <div class="path-row">
+          <input type="text" id="ws-csv" spellcheck="false" autocomplete="off" placeholder="Paste a path or browse">
+          <button class="secondary-btn" data-browse="csv" data-target="ws-csv">Browse…</button>
         </div>
+        <p class="muted small">A Camelot export. Its Media Filename and Trap Station Name columns give each photo's
+          position: station WCP-13 is position 13. Its species and Jay ID labels are imported too.</p>
         <div class="field-row">
-          <button id="start-upload-btn" class="primary-btn" disabled>Upload &amp; process</button>
-          <button id="cancel-upload-btn" class="ghost-btn hidden">Cancel upload</button>
+          <button id="ws-save" class="secondary-btn">Use this workspace</button>
+          <button id="ws-process" class="primary-btn hidden"></button>
         </div>
-        <div id="upload-progress" class="progress hidden"><div class="progress-bar"></div><span class="progress-label"></span></div>
-        <p id="upload-error" class="error hidden"></p>
+        <p id="ws-summary" class="pick-summary muted">No workspace chosen.</p>
+        <div id="ws-progress" class="progress hidden"><div class="progress-bar"></div><span class="progress-label"></span></div>
+        <p id="ws-error" class="error hidden"></p>
       </div>
 
       <div class="card">
@@ -70,7 +68,7 @@
     <div class="card">
       <div class="card-head">
         <h2>Processing queue</h2>
-        <span class="muted small">Jobs run one at a time.</span>
+        <span class="muted small">Results are saved after each batch of photos. If a run stops, it picks up where it left off.</span>
       </div>
       <div id="queue-list" class="queue-list"><p class="muted">Nothing processed yet.</p></div>
     </div>
@@ -84,6 +82,19 @@
         <span id="library-total" class="muted"></span>
       </div>
       <div id="species-grid" class="species-grid"></div>
+      <div id="compare-card" class="card compare-card hidden">
+        <div class="card-head">
+          <h2>AI vs Camelot</h2>
+          <span id="compare-summary" class="muted small"></span>
+        </div>
+        <p class="muted small">Photos by the species people labeled in Camelot. “AI only gave a group” means a broad label like “bird”, which isn't checked against the species. Click a count to see those photos.</p>
+        <div class="compare-scroll">
+          <table class="compare-table">
+            <thead><tr><th>Camelot species</th><th class="num">Photos</th><th class="num">AI agrees</th><th class="num">AI only gave a group</th><th class="num">AI disagrees</th><th>AI most often said</th></tr></thead>
+            <tbody id="compare-rows"></tbody>
+          </table>
+        </div>
+      </div>
     </div>
 
     <div id="library-group-view" class="hidden">
@@ -94,6 +105,15 @@
       </div>
       <div class="toolbar">
         <label>Position <select id="group-position"><option value="">All</option></select></label>
+        <label>AI vs Camelot
+          <select id="group-agreement">
+            <option value="">All</option>
+            <option value="agree">AI agrees</option>
+            <option value="group">AI only gave a group</option>
+            <option value="differ">AI disagrees</option>
+            <option value="none">Nothing to compare</option>
+          </select>
+        </label>
         <label>From <input type="date" id="group-start"></label>
         <label>To <input type="date" id="group-end"></label>
         <label>Sort
@@ -119,7 +139,7 @@
     </div>
     <div id="tl-legend" class="legend"></div>
     <div id="tl-empty" class="empty-state hidden">
-      Upload the Log and some photos on the Upload tab to see the timeline.
+      Upload the Log and process some photos on the Workspace tab to see the timeline.
     </div>
     <div id="tl-scroller" class="tl-scroller">
       <div id="tl-canvas" class="tl-canvas">
@@ -146,6 +166,7 @@
         <div class="label-sm">Species</div>
         <div id="v-species" class="species-name"></div>
         <div id="v-ai" class="muted small"></div>
+        <div id="v-camelot" class="muted small"></div>
         <div id="v-verified" class="muted small"></div>
       </div>
       <div class="edit-block">

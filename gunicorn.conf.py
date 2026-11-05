@@ -8,27 +8,19 @@ Run with:
 IMPORTANT: THIS APP MUST RUN AS A SINGLE WORKER PROCESS.
 =============================================================================
 
-This is not a tuning preference — multiple worker processes would break the
-app in two ways:
-
-1. DUPLICATE JOB QUEUES. app.py starts the background queue worker at import
-   time (`worker_thread.start()`), so every worker process would start its
-   own. Four workers means four jobs running MegaDetector/SpeciesNet at once
-   instead of the one-at-a-time FIFO the queue exists to enforce — which is
-   exactly what would exhaust GPU/CPU memory on a shared machine.
-
-2. DIVERGENT UPLOAD STATE. Library data lives in SQLite (runs/fsj.db), but
-   the manifest of in-progress chunked uploads is held in memory and
-   mirrored to JSON, so each process would track its own copy and reject
-   chunks the other one accepted.
+This is not a tuning preference — multiple worker processes would cause
+DUPLICATE JOB QUEUES. app.py starts the background queue worker at import
+time (`worker_thread.start()`), so every worker process would start its
+own. Four workers means four jobs running MegaDetector/SpeciesNet at once
+instead of the one-at-a-time FIFO the queue exists to enforce — which is
+exactly what would exhaust GPU/CPU memory on a shared machine.
 
 app.py's own module docstring already flags this for the Flask reloader, for
-the same reason. Concurrency here comes from THREADS (shared memory, and the
-existing threading.Lock guards around each store), never from processes.
+the same reason. Concurrency here comes from THREADS, never from processes.
 
 If you outgrow a single worker, the fix is architectural rather than a config
-change: move the upload manifest into the database and the job queue into a
-separate process (Celery/RQ), so the web workers become stateless. Bumping `workers` without doing that will corrupt data.
+change: move the job queue into a separate process (Celery/RQ), so the web
+workers become stateless. Bumping `workers` without doing that will corrupt data.
 """
 
 import multiprocessing  # noqa: F401  (kept so the single-worker choice below reads as deliberate)
@@ -59,8 +51,8 @@ worker_class = "gthread"
 threads = 8
 
 # Some requests can outlast Gunicorn's 30s default (e.g. importing a large
-# Log workbook, or a slow chunk upload). Killing those mid-flight would look
-# like a random failure to the user.
+# Log workbook, or a file dialog left open). Killing those mid-flight would
+# look like a random failure to the user.
 timeout = 300
 graceful_timeout = 30
 

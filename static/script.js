@@ -30,12 +30,6 @@ function esc(s) {
 
 function titleCase(s) { return String(s || "").replace(/\b[a-z]/g, (c) => c.toUpperCase()); }
 
-function fmtBytes(n) {
-  const u = ["B", "KB", "MB", "GB", "TB"]; let i = 0;
-  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-  return `${n.toFixed(i ? 1 : 0)} ${u[i]}`;
-}
-
 function fmtDateTime(iso) {
   if (!iso) return "No date";
   const [d, t] = iso.split("T");
@@ -86,132 +80,83 @@ document.querySelectorAll(".modal").forEach((m) => {
 });
 
 /* =====================================================================
- * Positions (shared by Upload, Library filter, viewer)
+ * Positions (shared by Library filter, viewer)
  * ===================================================================== */
 let positions = [];
 async function refreshPositions() {
   positions = await api("/api/positions");
   const opts = positions.map((p) => `<option value="${p}">Position ${p}</option>`).join("");
-  const sel = $("position-select"); const cur = sel.value;
-  sel.innerHTML = `<option value="">Choose…</option>${opts}`; sel.value = cur;
   const g = $("group-position"); const gcur = g.value;
   g.innerHTML = `<option value="">All</option>${opts}`; g.value = gcur;
   $("v-position").innerHTML = `<option value="">—</option>${opts}`;
 }
 
 /* =====================================================================
- * Upload tab
+ * Workspace tab
  * ===================================================================== */
-const PHOTO_RE = /\.(jpe?g|png|tiff?|bmp)$/i;
-let picked = [];          // File[]
-let pickedName = "";
-let uploadState = null;   // { batchId, aborted }
+let lastProcessed = null;
 
-function onPick(fileList, name) {
-  const seen = new Set(); let dupes = 0;
-  picked = [];
-  for (const f of fileList) {
-    if (!PHOTO_RE.test(f.name) || f.name.startsWith(".")) continue;
-    if (seen.has(f.name)) { dupes++; continue; }
-    seen.add(f.name); picked.push(f);
+function renderWorkspace(ws, { fillPaths = false } = {}) {
+  if (fillPaths && ws.folder) {
+    $("ws-folder").value = ws.folder;
+    $("ws-csv").value = ws.positions_csv;
   }
-  pickedName = name;
-  const total = picked.reduce((a, f) => a + f.size, 0);
-  $("pick-summary").textContent = picked.length
-    ? `${picked.length} photo${picked.length === 1 ? "" : "s"} (${fmtBytes(total)}) from “${name}”` +
-      (dupes ? ` — ${dupes} duplicate file name(s) skipped` : "")
-    : "No photos found in that selection.";
-  updateStartButton();
-}
-$("folder-input").addEventListener("change", (e) => {
-  const files = [...e.target.files];
-  const root = files[0]?.webkitRelativePath?.split("/")[0] || "folder";
-  onPick(files, root); e.target.value = "";
-});
-$("files-input").addEventListener("change", (e) => {
-  onPick([...e.target.files], "selected photos"); e.target.value = "";
-});
-$("position-select").addEventListener("change", updateStartButton);
-function updateStartButton() {
-  $("start-upload-btn").disabled = !(picked.length && $("position-select").value) || !!uploadState;
+  $("ws-save").disabled = ws.active;
+  const process = $("ws-process");
+  if (!ws.folder) return;
+
+  const n = (v) => v.toLocaleString();
+  const parts = [`${n(ws.photo_count)} photos in “${ws.folder}”, ${n(ws.with_labels ?? 0)} with Camelot labels.`];
+  if (ws.not_in_csv) parts.push(`${n(ws.not_in_csv)} aren't in the position CSV, so they'll have no position and won't appear on the Timeline until you set one in the Library.`);
+  $("ws-summary").textContent = parts.join(" ");
+
+  process.classList.toggle("hidden", !ws.pending && !ws.active);
+  process.disabled = ws.active;
+  const count = `${n(ws.pending)} photo${ws.pending === 1 ? "" : "s"}`;
+  process.textContent = ws.active ? "Processing…" : ws.processed ? `Process remaining ${count}` : `Process ${count}`;
+
+  const bar = $("ws-progress");
+  const finished = ws.photo_count - ws.pending;
+  bar.classList.toggle("hidden", !finished && !ws.active);
+  bar.querySelector(".progress-bar").style.width = `${ws.photo_count ? (100 * finished) / ws.photo_count : 0}%`;
+  bar.querySelector(".progress-label").textContent = `${n(finished)} of ${n(ws.photo_count)} photos processed`;
+
+  // New results arrive batch by batch during a run that can last days, so the
+  // other tabs refresh as they come in rather than only at the end.
+  if (lastProcessed !== null && ws.processed !== lastProcessed) {
+    libraryDirty = true; timeline.refreshPhotos(); refreshPositions(); loadTaxonomy();
+  }
+  lastProcessed = ws.processed;
 }
 
-function setProgress(done, total, label) {
-  $("upload-progress").classList.remove("hidden");
-  $("upload-progress").querySelector(".progress-bar").style.width = `${total ? (100 * done) / total : 0}%`;
-  $("upload-progress").querySelector(".progress-label").textContent = label;
+async function refreshWorkspace(opts) {
+  try { renderWorkspace(await api("/api/workspace"), opts); } catch (_) { /* next poll retries */ }
 }
 
-$("start-upload-btn").addEventListener("click", async () => {
-  showError($("upload-error"), "");
-  const pickedAtStart = picked;
-  const files = picked.slice();
-  const position = $("position-select").value;
-  uploadState = { batchId: null, aborted: false };
-  updateStartButton();
-  $("cancel-upload-btn").classList.remove("hidden");
+document.querySelectorAll("[data-browse]").forEach((btn) => btn.addEventListener("click", async () => {
+  showError($("ws-error"), "");
+  btn.disabled = true;
   try {
-    const init = await api("/api/uploads", { json: { files: files.map((f) => ({ path: f.name, size: f.size })) } });
-    uploadState.batchId = init.batch_id;
-    const chunkSize = init.chunk_size;
-    const tasks = [];
-    let totalBytes = 0, doneBytes = 0;
-    for (const f of files) {
-      const n = Math.max(1, Math.ceil(f.size / chunkSize));
-      const have = new Set(init.received[f.name] || []);
-      for (let i = 0; i < n; i++) {
-        const len = Math.min(chunkSize, f.size - i * chunkSize);
-        totalBytes += len;
-        if (have.has(i)) doneBytes += len; else tasks.push({ f, i, len });
-      }
-    }
-    const label = () => `Uploading… ${fmtBytes(doneBytes)} / ${fmtBytes(totalBytes)}`;
-    setProgress(doneBytes, totalBytes, label());
-
-    let next = 0;
-    async function worker() {
-      while (next < tasks.length && !uploadState.aborted) {
-        const t = tasks[next++];
-        for (let attempt = 0; ; attempt++) {
-          const fd = new FormData();
-          fd.append("path", t.f.name);
-          fd.append("chunk_index", t.i);
-          fd.append("chunk", t.f.slice(t.i * chunkSize, t.i * chunkSize + t.len));
-          try {
-            await api(`/api/uploads/${uploadState.batchId}/chunk`, { method: "POST", body: fd });
-            break;
-          } catch (err) {
-            if (uploadState.aborted || attempt >= 4 || (err.status && err.status < 500)) throw err;
-            await new Promise((r) => setTimeout(r, 1000 * 2 ** attempt));
-          }
-        }
-        doneBytes += t.len;
-        setProgress(doneBytes, totalBytes, label());
-      }
-    }
-    await Promise.all(Array.from({ length: 4 }, worker));
-    if (uploadState.aborted) return;
-
-    setProgress(1, 1, "Upload complete — queued for processing");
-    await api("/api/run", { json: { batch_id: uploadState.batchId, folder_name: pickedName, position } });
-    if (picked === pickedAtStart) {   // don't clear a new selection made meanwhile
-      picked = [];
-      $("pick-summary").textContent = "No photos chosen.";
-    }
-    refreshQueue();
-  } catch (err) {
-    if (!uploadState?.aborted) showError($("upload-error"), err.message);
-  } finally {
-    uploadState = null;
-    $("cancel-upload-btn").classList.add("hidden");
-    updateStartButton();
-  }
+    const { path } = await api("/api/workspace/browse", { json: { kind: btn.dataset.browse } });
+    if (path) $(btn.dataset.target).value = path;
+  } catch (err) { showError($("ws-error"), err.message); }
+  finally { btn.disabled = false; }
+}));
+$("ws-save").addEventListener("click", async () => {
+  showError($("ws-error"), "");
+  $("ws-save").disabled = true;
+  try {
+    const ws = await api("/api/workspace", { json: { folder: $("ws-folder").value, positions_csv: $("ws-csv").value } });
+    renderWorkspace(ws, { fillPaths: true });
+  } catch (err) { showError($("ws-error"), err.message); $("ws-save").disabled = false; }
 });
-$("cancel-upload-btn").addEventListener("click", async () => {
-  if (!uploadState) return;
-  uploadState.aborted = true;
-  if (uploadState.batchId) { try { await api(`/api/uploads/${uploadState.batchId}`, { method: "DELETE" }); } catch (_) {} }
-  setProgress(0, 1, "Upload cancelled");
+$("ws-process").addEventListener("click", async () => {
+  showError($("ws-error"), "");
+  $("ws-process").disabled = true;
+  try {
+    await api("/api/workspace/process", { json: {} });
+    await Promise.all([refreshWorkspace(), refreshQueue()]);
+  } catch (err) { showError($("ws-error"), err.message); $("ws-process").disabled = false; }
 });
 
 /* ----- queue ----- */
@@ -224,16 +169,16 @@ async function refreshQueue() {
     <div class="job">
       <div class="job-head">
         <span class="job-name">${esc(j.display_name)}</span>
-        <span class="muted small">Position ${esc(j.position)} · ${j.file_count ?? "?"} photos · ${esc(fmtDateTime(j.created_at))}</span>
-        <span class="status-pill ${esc(j.status)}">${j.status === "syncing" ? "reading metadata" : esc(j.status)}</span>
+        <span class="muted small">${(j.done_count ?? 0).toLocaleString()} of ${(j.file_count ?? 0).toLocaleString()} photos · ${esc(fmtDateTime(j.created_at))}</span>
+        <span class="status-pill ${esc(j.status)}">${esc(j.status)}</span>
         ${["queued", "running"].includes(j.status) ? `<button class="link-btn" data-cancel="${esc(j.id)}">Cancel</button>` : ""}
-        ${["error", "done"].includes(j.status) ? `<button class="link-btn" data-log="${esc(j.id)}">Show log</button>` : ""}
+        ${["error", "done", "cancelled"].includes(j.status) ? `<button class="link-btn" data-log="${esc(j.id)}">Show log</button>` : ""}
       </div>
       ${j.log_tail ? `<pre>${esc(j.log_tail)}</pre>` : ""}
       <pre class="hidden" id="log-${esc(j.id)}"></pre>
     </div>`).join("");
   el.querySelectorAll("[data-cancel]").forEach((b) => b.addEventListener("click", async () => {
-    if (!confirm("Cancel this job? Its uploaded photos will be deleted.")) return;
+    if (!confirm("Stop processing? Photos already finished are kept, and you can pick up the rest later. Your photo files aren't affected.")) return;
     try { await api(`/api/jobs/${b.dataset.cancel}/cancel`, { method: "POST" }); } catch (e) { alert(e.message); }
     refreshQueue();
   }));
@@ -243,12 +188,12 @@ async function refreshQueue() {
     const { log } = await api(`/api/jobs/${b.dataset.log}/log`);
     pre.textContent = log || "(empty)"; pre.classList.remove("hidden");
   }));
-  const active = jobs.some((j) => ["queued", "running", "syncing", "cancelling"].includes(j.status));
-  if (!active && hadActiveJobs) { libraryDirty = true; timeline.invalidatePhotos(); refreshPositions(); }
-  hadActiveJobs = active;
+  hadActiveJobs = jobs.some((j) => ["queued", "running", "cancelling"].includes(j.status));
 }
 let hadActiveJobs = false;
-setInterval(() => { if ($("tab-upload").classList.contains("active") || hadActiveJobs) refreshQueue(); }, 3000);
+setInterval(() => {
+  if ($("tab-workspace").classList.contains("active") || hadActiveJobs) { refreshQueue(); refreshWorkspace(); }
+}, 3000);
 
 /* ----- field log ----- */
 async function refreshLogSummary() {
@@ -282,17 +227,40 @@ $("log-input").addEventListener("change", async (e) => {
  * Library tab
  * ===================================================================== */
 let libraryDirty = true;
-const group = { species: null, items: [], total: 0 };
+const group = { species: null, camelotSpecies: null, items: [], total: 0 };
 
 tabHandlers.library = () => { if (libraryDirty) loadSpeciesGroups(); };
 
+async function loadCompare() {
+  const { species, totals } = await api("/api/camelot/compare");
+  $("compare-card").classList.toggle("hidden", !species.length);
+  if (!species.length) return;
+  const n = (v) => v.toLocaleString();
+  const compared = (totals.agree || 0) + (totals.group || 0) + (totals.differ || 0);
+  $("compare-summary").textContent =
+    `AI agrees on ${n(totals.agree || 0)} of ${n(compared)} photos compared (${Math.round((100 * (totals.agree || 0)) / (compared || 1))}%)`;
+  const cell = (r, kind) => `<td class="num">${r[kind]
+    ? `<button class="link-btn" data-camelot="${esc(r.species)}" data-agreement="${kind}">${n(r[kind])}</button>` : "0"}</td>`;
+  $("compare-rows").innerHTML = species.map((r) => `<tr>
+    <td>${esc(r.species)}</td>
+    <td class="num"><button class="link-btn" data-camelot="${esc(r.species)}" data-agreement="">${n(r.total)}</button></td>
+    ${cell(r, "agree")}${cell(r, "group")}${cell(r, "differ")}
+    <td class="muted">${esc(r.called.map(titleCase).join(", "))}</td>
+  </tr>`).join("");
+}
+$("compare-rows").addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-camelot]");
+  if (btn) openCamelotGroup(btn.dataset.camelot, btn.dataset.agreement);
+});
+
 async function loadSpeciesGroups() {
   libraryDirty = false;
+  loadCompare();
   const groups = await api("/api/species");
   const total = groups.reduce((a, g) => a + g.count, 0);
   $("library-total").textContent = `${total.toLocaleString()} photos`;
   const grid = $("species-grid");
-  if (!groups.length) { grid.innerHTML = `<div class="empty-state">No photos yet — upload some on the Upload tab.</div>`; return; }
+  if (!groups.length) { grid.innerHTML = `<div class="empty-state">No photos yet — process some on the Workspace tab.</div>`; return; }
   grid.innerHTML = groups.map((g) => `
     <button class="species-card" data-species="${esc(g.label)}">
       <div class="cover" style="background-image:url('/thumb/${esc(g.cover_id)}')"></div>
@@ -302,29 +270,40 @@ async function loadSpeciesGroups() {
       </div>
     </button>`).join("");
   grid.querySelectorAll(".species-card").forEach((c) => c.addEventListener("click", () => openGroup(c.dataset.species)));
-  if (group.species) loadGroupPage(true);
+  if (group.species || group.camelotSpecies) loadGroupPage(true);
 }
 
-function openGroup(species) {
-  group.species = species;
-  $("group-title").textContent = titleCase(species);
+function showGroup(title, agreement) {
+  $("group-title").textContent = title;
+  $("group-agreement").value = agreement;
   $("library-groups-view").classList.add("hidden");
   $("library-group-view").classList.remove("hidden");
   loadGroupPage(true);
 }
+function openGroup(species) {
+  group.species = species; group.camelotSpecies = null;
+  showGroup(titleCase(species), "");
+}
+function openCamelotGroup(species, agreement) {
+  group.species = null; group.camelotSpecies = species;
+  showGroup(`Camelot: ${species}`, agreement);
+}
 $("library-back").addEventListener("click", () => {
-  group.species = null;
+  group.species = null; group.camelotSpecies = null;
   $("library-group-view").classList.add("hidden");
   $("library-groups-view").classList.remove("hidden");
   if (libraryDirty) loadSpeciesGroups();
 });
-["group-position", "group-sort", "group-review", "group-start", "group-end"].forEach((id) =>
+["group-position", "group-agreement", "group-sort", "group-review", "group-start", "group-end"].forEach((id) =>
   $(id).addEventListener("change", () => loadGroupPage(true)));
 $("load-more").addEventListener("click", () => loadGroupPage(false));
 
 async function loadGroupPage(reset) {
   if (reset) { group.items = []; $("image-grid").innerHTML = ""; }
-  const p = new URLSearchParams({ species: group.species, offset: group.items.length, limit: 120, sort: $("group-sort").value });
+  const p = new URLSearchParams({ offset: group.items.length, limit: 120, sort: $("group-sort").value });
+  if (group.species) p.set("species", group.species);
+  if (group.camelotSpecies) p.set("camelot_species", group.camelotSpecies);
+  if ($("group-agreement").value) p.set("agreement", $("group-agreement").value);
   if ($("group-position").value) p.set("position", $("group-position").value);
   if ($("group-review").checked) p.set("review", "1");
   if ($("group-start").value) p.set("start", $("group-start").value);
@@ -374,6 +353,10 @@ const viewer = {
     $("v-ai").textContent = r.ai_species
       ? `AI: ${r.ai_species} (${Math.round((r.ai_conf || 0) * 100)}% classifier, ${Math.round((r.ai_det_conf || 0) * 100)}% detector)`
       : "AI: blank (no animal detected)";
+    const verdict = { agree: "AI agrees", group: "AI only gave a group", differ: "AI disagrees" }[r.camelot_agreement];
+    $("v-camelot").textContent = r.camelot_sightings.length
+      ? `Camelot: ${r.camelot_sightings.map((s) => s.species + (s.quantity > 1 ? ` ×${s.quantity}` : "") + (s.jay_id ? ` (${s.jay_id})` : "")).join("; ")}${verdict ? ` · ${verdict}` : ""}`
+      : "Camelot: no label";
     $("v-verified").textContent = r.corrected_species ? `Corrected ${fmtDateTime(r.corrected_at)}` : "";
     $("v-revert").classList.toggle("hidden", !r.corrected_species);
     $("v-correct").value = "";
@@ -455,7 +438,7 @@ $("v-save").addEventListener("click", () => viewerAction(() => {
   return api(`/api/images/${r.id}/update`, { json: body });
 }));
 $("v-delete").addEventListener("click", async () => {
-  if (!confirm("Delete this entry from the library? The photo file stays on the server.")) return;
+  if (!confirm("Delete this entry from the library? The photo file stays in your folder, and won't be processed again.")) return;
   try {
     await api(`/api/images/${viewer.rec.id}/delete`, { method: "POST" });
     viewer.changed();
@@ -507,6 +490,8 @@ const timeline = {
 
   invalidateEvents() { this.events = null; this.loaded = false; if (this.isActive()) this.load(); },
   invalidatePhotos() { this.daily = null; this.photosByDay.clear(); this.loaded = false; if (this.isActive()) this.load(); },
+  // Like invalidatePhotos, but keeps the current zoom and scroll position.
+  refreshPhotos() { this.daily = null; this.photosByDay.clear(); if (this.isActive() && this.loaded) this.load(); },
   isActive() { return $("tab-timeline").classList.contains("active"); },
 
   async load() {
@@ -528,8 +513,10 @@ const timeline = {
     this.buildRows();
     if (!this.loaded) { this.loaded = true; this.fit(); }
     else this.applyZoom(this.pxPerDay);
-    $("tl-status").textContent = range.undated_images
-      ? `${range.undated_images} photo(s) have no date and aren't shown.` : "";
+    $("tl-status").textContent = [
+      range.undated_images ? `${range.undated_images} photo(s) have no date and aren't shown.` : "",
+      range.unassigned_images ? `${range.unassigned_images} photo(s) have no position and aren't shown.` : "",
+    ].filter(Boolean).join(" ");
   },
 
   assignLanes() {
@@ -880,7 +867,7 @@ tabHandlers.timeline = () => { if (!timeline.loaded) timeline.load(); else timel
  * Boot
  * ===================================================================== */
 (async function boot() {
-  await Promise.all([refreshPositions(), refreshLogSummary(), loadTaxonomy(), refreshQueue()]);
+  await Promise.all([refreshPositions(), refreshLogSummary(), loadTaxonomy(), refreshQueue(), refreshWorkspace({ fillPaths: true })]);
   const initial = location.hash.slice(1);
-  if (["upload", "library", "timeline"].includes(initial)) switchTab(initial);
+  if (["workspace", "library", "timeline"].includes(initial)) switchTab(initial);
 })();
