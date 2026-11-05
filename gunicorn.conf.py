@@ -58,9 +58,9 @@ workers = 1
 worker_class = "gthread"
 threads = 8
 
-# Several requests legitimately outlast Gunicorn's 30s default:
-#   - /api/ocr-wizard/first-frame decodes a frame from a large video
-# Killing those mid-flight would look like a random failure to the user.
+# Some requests can outlast Gunicorn's 30s default (e.g. importing a large
+# Log workbook, or a slow chunk upload). Killing those mid-flight would look
+# like a random failure to the user.
 timeout = 300
 graceful_timeout = 30
 
