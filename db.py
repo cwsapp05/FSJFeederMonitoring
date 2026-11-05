@@ -39,10 +39,17 @@ CREATE TABLE IF NOT EXISTS images (
     folder             TEXT NOT NULL,
     filename           TEXT NOT NULL,
     position           INTEGER,
-    camera_id          TEXT,              -- from the info bar, e.g. C37
-    image_seq          TEXT,              -- from the info bar, e.g. 015
+    camera_id          TEXT,              -- EXIF UserComment ID=, e.g. C57
+    image_seq          TEXT,              -- EXIF UserComment LO=, e.g. 013
+    hardware_id        TEXT,              -- EXIF UserComment MA=: fixed per physical unit
+    battery            TEXT,              -- EXIF UserComment BP=, e.g. 50%
+    battery_source     TEXT,              -- EXIF UserComment BS=, e.g. EXT
+    trigger            TEXT,              -- EXIF UserComment TR=, e.g. MOTION
+    camera_model       TEXT,              -- EXIF Model, e.g. LL-3A
+    firmware           TEXT,              -- EXIF Software
+    exif_comment       TEXT,              -- the full UserComment, for keys not split out
     captured_at        TEXT,              -- YYYY-MM-DDTHH:MM:SS, camera-local time
-    time_source        TEXT,              -- exif | ocr | manual | NULL
+    time_source        TEXT,              -- exif | manual | NULL
     diel_period        TEXT,
     ai_species         TEXT,              -- NULL = blank
     ai_conf            REAL,
@@ -56,7 +63,6 @@ CREATE TABLE IF NOT EXISTS images (
     band_id            TEXT DEFAULT '',   -- reserved for banded-jay re-identification
     marked_for_review  INTEGER DEFAULT 1,
     metadata_edited    INTEGER DEFAULT 0,
-    ocr_raw            TEXT,
     has_thumbnail      INTEGER DEFAULT 0,
     created_at         TEXT
 );
@@ -91,11 +97,25 @@ write_lock = threading.RLock()
 _db_path = None
 
 
+# Columns added after the first release, so databases created by an earlier
+# version get them on startup. (CREATE TABLE IF NOT EXISTS doesn't add
+# columns to a table that already exists.)
+ADDED_COLUMNS = {
+    "images": ["hardware_id TEXT", "battery TEXT", "battery_source TEXT", "trigger TEXT",
+               "camera_model TEXT", "firmware TEXT", "exif_comment TEXT"],
+}
+
+
 def init(path):
     global _db_path
     _db_path = str(path)
     conn = connect()
     conn.executescript(SCHEMA)
+    for table, cols in ADDED_COLUMNS.items():
+        have = {r["name"] for r in conn.execute(f"PRAGMA table_info({table})")}
+        for col in cols:
+            if col.split()[0] not in have:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col}")
     conn.commit()
 
 

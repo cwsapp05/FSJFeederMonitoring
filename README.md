@@ -16,16 +16,25 @@ Use the legend chips to hide or show event types. Drag or Shift+scroll to pan, a
 
 ## Where photo metadata comes from
 
-`cuddeback_ocr.py` reads each photo's capture time from EXIF if the file has it. Otherwise it OCRs the Cuddeback info bar along the bottom of the photo:
+Cuddeback cameras write everything into each JPEG's EXIF, and `cuddeback_exif.py` reads it from there (there's no OCR):
 
-```
-[moon] [weather]   1/27/2026   12:28 PM   C37 - 015        [Cuddeback]
-                   date        time       camera  image #
-```
+| Field | EXIF source | Example |
+|---|---|---|
+| Capture date + time (to the second) | `DateTimeOriginal` | `2026:03:21 19:05:34` |
+| Camera name | `UserComment` → `ID=` | `C57` |
+| Image number | `UserComment` → `LO=` | `013` |
+| Hardware ID (stays with the physical unit if it's renamed) | `UserComment` → `MA=` | `151778739346` |
+| Battery level / source | `UserComment` → `BP=` / `BS=` | `50%` / `EXT` |
+| Trigger | `UserComment` → `TR=` | `MOTION` |
+| Model / firmware | `Model` / `Software` | `LL-3A FW 3.4.0` |
 
-The **position** is chosen at upload, not read from the photo. The camera name (`C37`) is stored for reference only. Mapping camera names to positions automatically would need a starting camera-to-position table, since the Log's CamSwitch sheet only records changes.
+The full `UserComment` is stored too, so other Cuddeback keys can be used later without reprocessing.
 
-To check OCR on a single photo: `python cuddeback_ocr.py path/to/photo.jpg`
+**Upload the original files from the SD card.** Photos that have been re-saved or exported (photo editors, messaging apps, some cloud sync) usually lose their EXIF. Those still get species predictions, but they have no date. The job log reports how many photos had no date, and you can set their time by hand in the Library viewer.
+
+The **position** is chosen at upload, not read from the photo. The camera name and hardware ID are stored for reference. Mapping them to positions automatically would need a starting camera-to-position table, since the Log's CamSwitch sheet only records changes.
+
+To check one photo: `python cuddeback_exif.py path/to/photo.jpg`
 
 ## The field Log
 
@@ -49,8 +58,6 @@ To check an import from the command line: `python log_import.py Log_withbaffle.x
 ```bash
 pip install -r requirements.txt
 ```
-
-You also need the Tesseract OCR binary (`brew install tesseract`, `apt install tesseract-ocr`, or the [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki) on Windows).
 
 This is a single-user app for your own computer: there is no sign-in, and it only listens on `127.0.0.1`, so other machines can't reach it.
 
@@ -95,7 +102,7 @@ SQLite replaces ArbCameraTrapCV's JSON files, which slowed down past ~10k entrie
 ```
 app.py              Flask backend: upload, job queue, library, Log + timeline APIs
 db.py               SQLite schema and helpers
-cuddeback_ocr.py    EXIF / info-bar reading for Cuddeback photos
+cuddeback_exif.py   reads date/time, camera name and other fields from Cuddeback EXIF
 log_import.py       Log workbook → timeline events
 wsgi.py, gunicorn.conf.py, serve_windows.py   production entry points
 templates/index.html, static/script.js, static/style.css   frontend (no build step)

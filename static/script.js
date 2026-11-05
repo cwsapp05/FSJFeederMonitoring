@@ -384,8 +384,14 @@ const viewer = {
     $("v-notes").value = r.notes || "";
     $("v-review").checked = r.marked_for_review;
     const meta = [
-      ["File", r.filename], ["Camera", r.camera_id ? `${r.camera_id}${r.image_seq ? " – " + r.image_seq : ""}` : "not read"],
-      ["Time from", r.time_source || "unknown"], ["Diel period", r.diel_period], ["Info bar OCR", r.ocr_raw],
+      ["File", r.filename],
+      ["Camera", r.camera_id ? `${r.camera_id}${r.image_seq ? " · image " + r.image_seq : ""}` : "not in file"],
+      ["Hardware ID", r.hardware_id],
+      ["Model", r.firmware || r.camera_model],
+      ["Battery", r.battery ? `${r.battery}${r.battery_source ? " (" + r.battery_source + ")" : ""}` : null],
+      ["Trigger", r.trigger],
+      ["Time from", { exif: "EXIF", manual: "set by hand" }[r.time_source] || "no date in file"],
+      ["Diel period", r.diel_period],
     ].filter(([, v]) => v);
     $("v-meta").innerHTML = meta.map(([k, v]) => `<span>${esc(k)}</span><span>${esc(v)}</span>`).join("");
   },

@@ -6,9 +6,9 @@ photos from Cuddeback feeder cameras. Three tabs:
 
   Upload    pick a folder of photos + the feeder position they came from;
             they're chunk-uploaded to this server, queued, and run through
-            MegaDetector + SpeciesNet. Each photo's date/time/camera name is
-            read from EXIF or, failing that, from the Cuddeback info bar via
-            OCR (cuddeback_ocr.py). The field Log workbook is uploaded here too.
+            MegaDetector + SpeciesNet. Each photo's date/time, camera name and
+            other Cuddeback fields are read from its EXIF (cuddeback_exif.py).
+            The field Log workbook is uploaded here too.
   Library   photos grouped by species, with correction, count, notes,
             band ID and review flag.
   Timeline  Log events (log_import.py) and photos laid out on a scrollable
@@ -47,7 +47,7 @@ from pathlib import Path
 from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 from PIL import Image, ImageOps
 
-import cuddeback_ocr
+import cuddeback_exif
 import db
 import log_import
 
@@ -540,43 +540,52 @@ def sync_images_from_job(job_id, log):
     log.write(f"\nReading metadata and making thumbnails for {len(entries)} photos...\n")
     log.flush()
 
+    undated = 0
     for i, img in enumerate(entries, 1):
         filename = img.get("file", "")
         path = folder / filename
         image_id = image_id_for(job_id, filename)
         ai_species, ai_conf, ai_det_conf, ai_count = _best_species(img.get("detections") or [], class_cats)
-        meta = cuddeback_ocr.read_photo_metadata(path)
+        meta = cuddeback_exif.read_photo_metadata(path)
         has_thumb = make_thumbnail(path, image_id)
 
         existing = db.query_one("SELECT * FROM images WHERE id = ?", (image_id,))
         if existing and existing["metadata_edited"]:
             captured_at, time_source = existing["captured_at"], existing["time_source"]
         else:
-            captured_at, time_source = meta["captured_at"], meta["time_source"]
+            captured_at = meta["captured_at"]
+            time_source = "exif" if captured_at else None
+        if not captured_at:
+            undated += 1
         corrected = existing["corrected_species"] if existing else None
         display = corrected or ai_species or "blank"
 
+        exif_cols = ("camera_id", "image_seq", "hardware_id", "battery", "battery_source",
+                     "trigger", "camera_model", "firmware", "exif_comment")
+        cols = ("id", "job_id", "folder", "filename", "position", *exif_cols,
+                "captured_at", "time_source", "diel_period", "ai_species", "ai_conf", "ai_det_conf",
+                "display_species", "count", "has_thumbnail", "created_at")
+        values = (image_id, job_id, str(folder), filename, job["position"],
+                  *(meta[c] for c in exif_cols),
+                  captured_at, time_source, compute_diel_period(captured_at), ai_species,
+                  round(ai_conf, 3) if ai_conf is not None else None,
+                  round(ai_det_conf, 3) if ai_det_conf is not None else None,
+                  display, ai_count, int(has_thumb), now_iso())
+        # On reprocessing, refresh machine-derived fields only; human edits
+        # (corrections, count, notes, band ID, review flag) are left alone.
+        refresh = (*exif_cols, "captured_at", "time_source", "diel_period", "ai_species", "ai_conf",
+                   "ai_det_conf", "display_species", "has_thumbnail")
         with db.transaction() as conn:
             conn.execute(
-                """INSERT INTO images(id, job_id, folder, filename, position, camera_id, image_seq,
-                       captured_at, time_source, diel_period, ai_species, ai_conf, ai_det_conf,
-                       display_species, count, ocr_raw, has_thumbnail, created_at)
-                   VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(id) DO UPDATE SET
-                       camera_id = excluded.camera_id, image_seq = excluded.image_seq,
-                       captured_at = excluded.captured_at, time_source = excluded.time_source,
-                       diel_period = excluded.diel_period, ai_species = excluded.ai_species,
-                       ai_conf = excluded.ai_conf, ai_det_conf = excluded.ai_det_conf,
-                       display_species = excluded.display_species, ocr_raw = excluded.ocr_raw,
-                       has_thumbnail = excluded.has_thumbnail""",
-                (image_id, job_id, str(folder), filename, job["position"], meta["camera_id"],
-                 meta["image_seq"], captured_at, time_source, compute_diel_period(captured_at),
-                 ai_species, round(ai_conf, 3) if ai_conf is not None else None,
-                 round(ai_det_conf, 3) if ai_det_conf is not None else None,
-                 display, ai_count, meta["ocr_raw"], int(has_thumb), now_iso()))
+                f"""INSERT INTO images({", ".join(cols)}) VALUES({", ".join("?" * len(cols))})
+                    ON CONFLICT(id) DO UPDATE SET {", ".join(f"{c} = excluded.{c}" for c in refresh)}""",
+                values)
         if i % 100 == 0 or i == len(entries):
             log.write(f"  {i}/{len(entries)}\n")
             log.flush()
+    if undated:
+        log.write(f"{undated} photo(s) had no EXIF capture time (not original camera files?) "
+                  "and won't appear on the Timeline until dated by hand in the Library.\n")
     log.write("Done.\n")
 
 
@@ -588,7 +597,8 @@ IMAGE_PUBLIC_FIELDS = (
     "id", "job_id", "filename", "position", "camera_id", "image_seq", "captured_at", "time_source",
     "diel_period", "ai_species", "ai_conf", "ai_det_conf", "corrected_species", "corrected_by",
     "corrected_at", "display_species", "count", "notes", "band_id", "marked_for_review",
-    "metadata_edited", "ocr_raw", "has_thumbnail",
+    "metadata_edited", "has_thumbnail", "hardware_id", "battery", "battery_source", "trigger",
+    "camera_model", "firmware", "exif_comment",
 )
 
 
