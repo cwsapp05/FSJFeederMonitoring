@@ -17,7 +17,6 @@ async function api(url, opts = {}) {
   let data = null;
   try { data = await res.json(); } catch (_) { /* non-JSON */ }
   if (!res.ok) {
-    if (res.status === 401) openSignin();
     const err = new Error((data && data.error) || `Request failed (${res.status})`);
     err.status = res.status;
     throw err;
@@ -80,33 +79,6 @@ function switchTab(name) {
   if (tabHandlers[name]) tabHandlers[name]();
 }
 
-/* =====================================================================
- * Auth
- * ===================================================================== */
-let me = { signed_in: false };
-async function refreshMe() {
-  me = await api("/api/auth/me");
-  $("account-name").textContent = me.signed_in ? `${me.first_name} ${me.last_name}` : "";
-  $("account-btn").textContent = me.signed_in ? "Sign out" : "Sign in";
-}
-$("account-btn").addEventListener("click", async () => {
-  if (me.signed_in) { await api("/api/auth/logout", { method: "POST" }); refreshMe(); }
-  else openSignin();
-});
-function openSignin() {
-  showError($("signin-error"), "");
-  $("signin-modal").classList.remove("hidden");
-  setTimeout(() => $("signin-user").focus(), 0);
-}
-$("signin-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  try {
-    await api("/api/auth/login", { json: { username: $("signin-user").value, password: $("signin-pass").value } });
-    $("signin-pass").value = "";
-    $("signin-modal").classList.add("hidden");
-    refreshMe();
-  } catch (err) { showError($("signin-error"), err.message); }
-});
 document.querySelectorAll(".modal").forEach((m) => {
   m.addEventListener("click", (e) => {
     if (e.target === m || e.target.closest("[data-close]")) m.classList.add("hidden");
@@ -171,7 +143,6 @@ function setProgress(done, total, label) {
 }
 
 $("start-upload-btn").addEventListener("click", async () => {
-  if (!me.signed_in) { openSignin(); return; }
   showError($("upload-error"), "");
   const pickedAtStart = picked;
   const files = picked.slice();
@@ -253,7 +224,7 @@ async function refreshQueue() {
     <div class="job">
       <div class="job-head">
         <span class="job-name">${esc(j.display_name)}</span>
-        <span class="muted small">Position ${esc(j.position)} · ${j.file_count ?? "?"} photos · ${esc(fmtDateTime(j.created_at))}${j.created_by ? " · " + esc(j.created_by) : ""}</span>
+        <span class="muted small">Position ${esc(j.position)} · ${j.file_count ?? "?"} photos · ${esc(fmtDateTime(j.created_at))}</span>
         <span class="status-pill ${esc(j.status)}">${j.status === "syncing" ? "reading metadata" : esc(j.status)}</span>
         ${["queued", "running"].includes(j.status) ? `<button class="link-btn" data-cancel="${esc(j.id)}">Cancel</button>` : ""}
         ${["error", "done"].includes(j.status) ? `<button class="link-btn" data-log="${esc(j.id)}">Show log</button>` : ""}
@@ -288,14 +259,13 @@ async function refreshLogSummary() {
     .map(([k, n]) => `${esc(kinds[k] || k)}: ${n}`).join(" · ");
   $("log-summary").innerHTML = `<dl>
     <dt>File</dt><dd>${esc(info.filename)}</dd>
-    <dt>Uploaded</dt><dd>${esc(fmtDateTime(info.uploaded_at))}${info.uploaded_by ? " by " + esc(info.uploaded_by) : ""}</dd>
+    <dt>Uploaded</dt><dd>${esc(fmtDateTime(info.uploaded_at))}</dd>
     <dt>Covers</dt><dd>${esc(fmtDateTime(info.first_date))} – ${esc(fmtDateTime(info.last_date))} (${info.rows.toLocaleString()} rows)</dd>
     <dt>Events</dt><dd>${counts || "none"}</dd></dl>`;
 }
 $("log-input").addEventListener("change", async (e) => {
   const file = e.target.files[0]; e.target.value = "";
   if (!file) return;
-  if (!me.signed_in) { openSignin(); return; }
   showError($("log-error"), "");
   $("log-uploading").classList.remove("hidden");
   const fd = new FormData(); fd.append("file", file);
@@ -404,7 +374,7 @@ const viewer = {
     $("v-ai").textContent = r.ai_species
       ? `AI: ${r.ai_species} (${Math.round((r.ai_conf || 0) * 100)}% classifier, ${Math.round((r.ai_det_conf || 0) * 100)}% detector)`
       : "AI: blank (no animal detected)";
-    $("v-verified").textContent = r.corrected_species ? `Verified by ${r.corrected_by || "unknown"} · ${fmtDateTime(r.corrected_at)}` : "";
+    $("v-verified").textContent = r.corrected_species ? `Corrected ${fmtDateTime(r.corrected_at)}` : "";
     $("v-revert").classList.toggle("hidden", !r.corrected_species);
     $("v-correct").value = "";
     $("v-datetime").value = r.captured_at ? r.captured_at.slice(0, 16) : "";
@@ -447,7 +417,6 @@ async function loadTaxonomy() {
 
 async function viewerAction(fn) {
   showError($("v-error"), "");
-  if (!me.signed_in) { openSignin(); return; }
   try { await fn(); viewer.changed(); await viewer.load(); refreshGroupCard(); }
   catch (err) { showError($("v-error"), err.message); }
 }
@@ -480,7 +449,6 @@ $("v-save").addEventListener("click", () => viewerAction(() => {
   return api(`/api/images/${r.id}/update`, { json: body });
 }));
 $("v-delete").addEventListener("click", async () => {
-  if (!me.signed_in) { openSignin(); return; }
   if (!confirm("Delete this entry from the library? The photo file stays on the server.")) return;
   try {
     await api(`/api/images/${viewer.rec.id}/delete`, { method: "POST" });
@@ -906,7 +874,6 @@ tabHandlers.timeline = () => { if (!timeline.loaded) timeline.load(); else timel
  * Boot
  * ===================================================================== */
 (async function boot() {
-  await refreshMe();
   await Promise.all([refreshPositions(), refreshLogSummary(), loadTaxonomy(), refreshQueue()]);
   const initial = location.hash.slice(1);
   if (["upload", "library", "timeline"].includes(initial)) switchTab(initial);

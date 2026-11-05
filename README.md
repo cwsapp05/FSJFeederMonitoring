@@ -52,11 +52,7 @@ pip install -r requirements.txt
 
 You also need the Tesseract OCR binary (`brew install tesseract`, `apt install tesseract-ocr`, or the [UB-Mannheim build](https://github.com/UB-Mannheim/tesseract/wiki) on Windows).
 
-Create accounts. There is no sign-up page; signing in is required to upload and edit, while viewing is open.
-
-```bash
-python manage_users.py add <username> <first_name> <last_name>
-```
+This is a single-user app for your own computer: there is no sign-in, and it only listens on `127.0.0.1`, so other machines can't reach it.
 
 Run:
 
@@ -76,7 +72,7 @@ python serve_windows.py                    # production, Windows
 | `SPECIESNET_COUNTRY` / `SPECIESNET_ADMIN1` | `USA` / `FL` | SpeciesNet geofencing; set the country to empty to disable |
 | `SITE_LAT` / `SITE_LON` | unset | If set, each photo gets a Dawn/Day/Dusk/Night label |
 | `TIMEZONE` | `America/New_York` | Used with the above |
-| `HOST` / `PORT` | `127.0.0.1` / `5000` | Server address |
+| `HOST` / `PORT` | `127.0.0.1` / `5000` | Server address (keep `127.0.0.1` — there is no sign-in) |
 
 ## Storage
 
@@ -88,7 +84,6 @@ runs/uploads/<batch>/ uploaded photos, served from here (never copied again)
 runs/thumbnails/      480px thumbnails for the grids and timeline
 runs/jobs/<job>/      predictions.json and log.txt per processing job
 runs/log/latest.xlsx  the most recently uploaded Log
-runs/users.json       accounts (manage_users.py)
 ```
 
 SQLite replaces ArbCameraTrapCV's JSON files, which slowed down past ~10k entries.
@@ -100,7 +95,6 @@ app.py              Flask backend: upload, job queue, library, Log + timeline AP
 db.py               SQLite schema and helpers
 cuddeback_ocr.py    EXIF / info-bar reading for Cuddeback photos
 log_import.py       Log workbook → timeline events
-manage_users.py     account management
 wsgi.py, gunicorn.conf.py, serve_windows.py   production entry points
 templates/index.html, static/script.js, static/style.css   frontend (no build step)
 ```

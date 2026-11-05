@@ -14,6 +14,9 @@ photos from Cuddeback feeder cameras. Three tabs:
   Timeline  Log events (log_import.py) and photos laid out on a scrollable
             per-position timeline.
 
+Single-user, local app: there is no sign-in, and it listens on 127.0.0.1
+(this computer only) by default.
+
 Storage is SQLite (runs/fsj.db, see db.py) plus the uploaded photos and
 thumbnails under runs/. Photos are served from where they were uploaded and
 never copied again.
@@ -33,19 +36,16 @@ import errno
 import hashlib
 import json
 import os
-import secrets
 import shutil
 import subprocess
 import sys
 import threading
 import uuid
 from datetime import datetime, timedelta
-from functools import wraps
 from pathlib import Path
 
-from flask import Flask, abort, jsonify, render_template, request, send_from_directory, session
+from flask import Flask, abort, jsonify, render_template, request, send_from_directory
 from PIL import Image, ImageOps
-from werkzeug.security import check_password_hash
 
 import cuddeback_ocr
 import db
@@ -64,9 +64,7 @@ JOBS_DIR = RUNS_DIR / "jobs"
 JOBS_DIR.mkdir(exist_ok=True)
 LOG_DIR = RUNS_DIR / "log"
 LOG_DIR.mkdir(exist_ok=True)
-USERS_FILE = RUNS_DIR / "users.json"
 UPLOAD_BATCHES_FILE = RUNS_DIR / "upload_batches.json"
-SECRET_KEY_FILE = RUNS_DIR / "secret_key.txt"
 
 db.init(RUNS_DIR / "fsj.db")
 
@@ -90,86 +88,13 @@ SITE_LON = os.environ.get("SITE_LON")
 SITE_TIMEZONE = os.environ.get("TIMEZONE", "America/New_York")
 
 
-def _load_or_create_secret_key():
-    if SECRET_KEY_FILE.exists():
-        return SECRET_KEY_FILE.read_text().strip()
-    key = secrets.token_hex(32)
-    SECRET_KEY_FILE.write_text(key)
-    return key
-
-
 app.config.update(
-    SECRET_KEY=_load_or_create_secret_key(),
-    SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SAMESITE="Lax",
-    PERMANENT_SESSION_LIFETIME=timedelta(days=30),
     MAX_CONTENT_LENGTH=64 * 1024 * 1024,  # per request; photos arrive in 8MB chunks
 )
 
 
 def now_iso():
     return datetime.now().isoformat(timespec="seconds")
-
-
-# ===========================================================================
-# Accounts (same model as ArbCameraTrapCV: runs/users.json, managed with
-# manage_users.py, no sign-up page)
-# ===========================================================================
-
-def load_users():
-    if USERS_FILE.exists():
-        return json.loads(USERS_FILE.read_text())
-    return {}
-
-
-def current_user():
-    username = session.get("username")
-    return load_users().get(username) if username else None
-
-
-def current_user_name():
-    u = current_user()
-    return f"{u['first_name']} {u['last_name']}" if u else None
-
-
-def login_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if current_user() is None:
-            return jsonify({"error": "Sign-in required"}), 401
-        return view(*args, **kwargs)
-    return wrapped
-
-
-@app.route("/api/auth/login", methods=["POST"])
-def login():
-    data = request.get_json(force=True)
-    username = (data.get("username") or "").strip().lower()
-    user = load_users().get(username)
-    if not user or not check_password_hash(user["password_hash"], data.get("password") or ""):
-        return jsonify({"error": "Incorrect username or password"}), 401
-    session.clear()
-    session["username"] = username
-    session.permanent = True
-    return jsonify({"signed_in": True, "username": username,
-                    "first_name": user["first_name"], "last_name": user["last_name"]})
-
-
-@app.route("/api/auth/logout", methods=["POST"])
-def logout():
-    session.clear()
-    return jsonify({"ok": True})
-
-
-@app.route("/api/auth/me")
-def auth_me():
-    username = session.get("username")
-    user = load_users().get(username) if username else None
-    if not user:
-        session.clear()
-        return jsonify({"signed_in": False})
-    return jsonify({"signed_in": True, "username": username,
-                    "first_name": user["first_name"], "last_name": user["last_name"]})
 
 
 # ===========================================================================
@@ -227,7 +152,6 @@ def _sanitize_relpath(raw):
 
 
 @app.route("/api/uploads", methods=["POST"])
-@login_required
 def init_upload_batch():
     """Body: {"files": [{"path", "size"}], "resume_batch_id"?}. Pre-sizes each
     destination file so chunks can be written at their offsets in any order.
@@ -273,7 +197,6 @@ def init_upload_batch():
 
 
 @app.route("/api/uploads/<batch_id>/chunk", methods=["POST"])
-@login_required
 def upload_chunk(batch_id):
     with upload_batches_lock:
         manifest = upload_batches.get(batch_id)
@@ -312,7 +235,6 @@ def upload_chunk(batch_id):
 
 
 @app.route("/api/uploads/<batch_id>", methods=["DELETE"])
-@login_required
 def delete_upload_batch(batch_id):
     with upload_batches_lock:
         manifest = upload_batches.get(batch_id)
@@ -346,7 +268,6 @@ def _set_job(job_id, **fields):
 
 
 @app.route("/api/run", methods=["POST"])
-@login_required
 def run_job():
     data = request.get_json(force=True)
     batch_id = (data.get("batch_id") or "").strip()
@@ -388,7 +309,7 @@ def run_job():
                             output_json, log_file, cmd, file_count, created_by)
            VALUES(?, ?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?, ?)""",
         (job_id, seq, batch_id, display_name or batch_id, position, now_iso(), str(folder),
-         str(output_json), str(log_file), json.dumps(cmd), file_count, current_user_name()))
+         str(output_json), str(log_file), json.dumps(cmd), file_count, None))
 
     with upload_batches_lock:
         upload_batches[batch_id]["status"] = "processing"
@@ -476,7 +397,6 @@ def _terminate_then_kill(proc):
 
 
 @app.route("/api/jobs/<job_id>/cancel", methods=["POST"])
-@login_required
 def cancel_job(job_id):
     job = _job(job_id)
     if not job:
@@ -746,7 +666,6 @@ def get_image(image_id):
 
 
 @app.route("/api/images/<image_id>/correct", methods=["POST"])
-@login_required
 def correct_species(image_id):
     """{"species": "<label>"} sets a correction; "" clears it (back to AI)."""
     r = _get_image_or_404(image_id)
@@ -756,7 +675,7 @@ def correct_species(image_id):
         db.execute(
             """UPDATE images SET corrected_species = ?, corrected_by = ?, corrected_at = ?,
                    display_species = ?, marked_for_review = 0 WHERE id = ?""",
-            (species, current_user_name(), now_iso(), species, image_id))
+            (species, None, now_iso(), species, image_id))
     else:
         db.execute(
             """UPDATE images SET corrected_species = NULL, corrected_by = NULL, corrected_at = NULL,
@@ -766,7 +685,6 @@ def correct_species(image_id):
 
 
 @app.route("/api/images/<image_id>/update", methods=["POST"])
-@login_required
 def update_image(image_id):
     """Any of: count, notes, band_id, marked_for_review, position,
     captured_at ("YYYY-MM-DDTHH:MM")."""
@@ -806,7 +724,6 @@ def update_image(image_id):
 
 
 @app.route("/api/images/<image_id>/delete", methods=["POST"])
-@login_required
 def delete_image(image_id):
     """Removes the library record and its thumbnail. The uploaded photo file
     itself stays on disk (same as ArbCameraTrapCV's single-entry delete)."""
@@ -848,7 +765,6 @@ def log_info():
 
 
 @app.route("/api/log", methods=["POST"])
-@login_required
 def upload_log():
     """Replaces the stored Log with a newly uploaded workbook. Excel stays the
     source of truth: every upload is a full replacement, nothing is merged."""
@@ -863,8 +779,7 @@ def upload_log():
         tmp.unlink(missing_ok=True)
         return jsonify({"error": str(e)}), 400
 
-    info = {**result["summary"], "filename": f.filename, "uploaded_at": now_iso(),
-            "uploaded_by": current_user_name()}
+    info = {**result["summary"], "filename": f.filename, "uploaded_at": now_iso()}
     with db.transaction() as conn:
         conn.execute("DELETE FROM log_events")
         conn.executemany(

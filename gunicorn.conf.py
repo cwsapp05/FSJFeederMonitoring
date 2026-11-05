@@ -45,7 +45,7 @@ import os
 # nothing of yours running. Either disable it (System Settings > General >
 # AirDrop & Handoff > AirPlay Receiver) or set PORT to something else.
 # To see what currently holds a port:  lsof -nP -iTCP:5000 -sTCP:LISTEN
-bind = f"{os.environ.get('HOST', '0.0.0.0')}:{os.environ.get('PORT', '5000')}"
+bind = f"{os.environ.get('HOST', '127.0.0.1')}:{os.environ.get('PORT', '5000')}"
 
 # ---------------------------------------------------------------------------
 # Worker processes — see the warning above before changing `workers`.
