@@ -77,6 +77,13 @@ PROCESS_BATCH_SIZE = int(os.environ.get("PROCESS_BATCH_SIZE", "500"))
 # also uses.
 DETECTOR_MODEL = "MDV5A"
 DETECTOR_OUTPUT_THRESHOLD = "0.005"
+# Runs after SpeciesNet, whose label list has no Florida Scrub-Jay. See training/.
+SPECIES_MODEL = BASE_DIR / "models" / "florida_scrub_jay.pt"
+SPECIES_MODEL_LABEL = "florida scrub-jay"
+# Stands in for an answer on photos SpeciesNet hasn't seen (training/relabel_library.py
+# adds these). Stored in speciesnet_species, and in ai_species unless the scrub-jay
+# model called the photo. Unlike "blank", it doesn't claim the photo is empty.
+NOT_CLASSIFIED = "not classified"
 
 # Columns of the Camelot export that say which station each photo came from.
 POSITION_FILE_COLUMN = "Media Filename"
@@ -235,6 +242,9 @@ def camelot_agreement(sightings, ai_species, ai_is_group):
     labels -= CAMELOT_NOT_COMPARABLE
     if not labels:
         return None
+    if ai_species == NOT_CLASSIFIED:
+        # Only the scrub-jay model has seen this photo, and it said no.
+        return "differ" if SPECIES_MODEL_LABEL in labels else None
     ai = (ai_species or "blank").lower()
     if ai in labels or ("crow sp." in labels and ai.endswith(" crow")):
         return "agree"
@@ -254,9 +264,9 @@ def camelot_fields(filename, ai_species, ai_is_group, sightings_by_stem):
 
 
 def pending_photos(folder):
-    """Photos in the folder that aren't in the Library yet (and weren't deleted
-    from it)."""
-    known = {r["filename"] for r in db.query("SELECT filename FROM images")}
+    """Photos in the folder that SpeciesNet hasn't seen yet (and weren't deleted
+    from the Library)."""
+    known = {r["filename"] for r in db.query("SELECT filename FROM images WHERE speciesnet_species IS NOT ?", (NOT_CLASSIFIED,))}
     known |= {r["filename"] for r in db.query("SELECT filename FROM dismissed_photos")}
     return [p for p in scan_photos(folder) if p not in known]
 
@@ -269,7 +279,7 @@ def workspace_state():
     state = {"folder": None, "active": has_active_job()}
     workspace = get_kv("workspace")
     if workspace:
-        processed = db.query_one("SELECT COUNT(*) AS n FROM images")["n"]
+        processed = db.query_one("SELECT COUNT(*) AS n FROM images WHERE speciesnet_species IS NOT ?", (NOT_CLASSIFIED,))["n"]
         dismissed = db.query_one("SELECT COUNT(*) AS n FROM dismissed_photos")["n"]
         state.update(workspace, processed=processed,
                      pending=max(0, workspace["photo_count"] - processed - dismissed))
@@ -498,11 +508,28 @@ def _is_cancelling(job_id):
     return _job(job_id)["status"] == "cancelling"
 
 
+def _scores_file(predictions):
+    return predictions.with_name(predictions.name.replace("predictions-", "scores-"))
+
+
+def species_model_python():
+    """The scrub-jay step needs PyTorch and uses a GPU if there is one, so it
+    prefers the training environment (see README) over this app's environment."""
+    override = os.environ.get("SPECIES_MODEL_PYTHON")
+    if override:
+        return override
+    for candidate in (BASE_DIR / ".venv-train" / "Scripts" / "python.exe", BASE_DIR / ".venv-train" / "bin" / "python"):
+        if candidate.exists():
+            return str(candidate)
+    return sys.executable
+
+
 def _run_pipeline(job_id, folder, batch, log):
-    """Runs MegaDetector, then SpeciesNet on its detections. The combined
-    pipeline command can only take a whole folder, while the detector can take
-    a list of files, which is what lets the photos stay in one folder. Returns
-    the predictions file, or None if a step failed or was cancelled."""
+    """Runs MegaDetector, then SpeciesNet on its detections, then the scrub-jay
+    model if there is one. The combined pipeline command can only take a whole
+    folder, while the detector can take a list of files, which is what lets the
+    photos stay in one folder. Returns the predictions file, or None if a step
+    failed or was cancelled."""
     job_dir = Path(_job(job_id)["log_file"]).parent
     file_list = job_dir / "batch_files.json"
     detections = job_dir / "batch_detections.json"
@@ -521,9 +548,17 @@ def _run_pipeline(job_id, folder, batch, log):
             classify += ["--admin1_region", SPECIESNET_ADMIN1]
 
     try:
-        if _run_step(job_id, detect, log) and not _is_cancelling(job_id) and _run_step(job_id, classify, log):
-            return predictions
-        return None
+        if not (_run_step(job_id, detect, log) and not _is_cancelling(job_id) and _run_step(job_id, classify, log)):
+            return None
+        if SPECIES_MODEL.exists() and not _is_cancelling(job_id):
+            scores = _scores_file(predictions)
+            scores.unlink(missing_ok=True)
+            score = [species_model_python(), str(BASE_DIR / "training" / "score_photos.py"),
+                     "--predictions", str(predictions), "--folder", folder,
+                     "--model", str(SPECIES_MODEL), "--out", str(scores)]
+            if not _run_step(job_id, score, log):
+                return None
+        return predictions
     finally:
         file_list.unlink(missing_ok=True)
         detections.unlink(missing_ok=True)
@@ -705,10 +740,14 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
     data = json.loads(predictions_file.read_text(encoding="utf-8"))
     class_cats = data.get("classification_categories", {})
     group_labels = _group_labels(data)
+    scores_path = _scores_file(predictions_file)
+    species_scores = json.loads(scores_path.read_text(encoding="utf-8")) if scores_path.exists() else None
 
     with db.transaction() as conn:
         conn.executemany("INSERT OR IGNORE INTO species(label) VALUES(?)",
                          [(label,) for label in class_cats.values()])
+        if species_scores:
+            conn.execute("INSERT OR IGNORE INTO species(label) VALUES(?)", (SPECIES_MODEL_LABEL,))
 
     folder = Path(folder)
     entries = data.get("images", [])
@@ -728,6 +767,13 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
         path = folder / filename
         image_id = image_id_for(filename)
         ai_species, ai_conf, ai_det_conf, ai_count = _best_species(img.get("detections") or [], class_cats)
+        speciesnet_species = ai_species
+        fsj = (species_scores or {"photos": {}})["photos"].get(img.get("file"))
+        fsj_score = fsj["score"] if fsj else None
+        fsj_possible = 0
+        if fsj and fsj_score >= species_scores["threshold"]:
+            ai_species, ai_conf, ai_count = SPECIES_MODEL_LABEL, fsj_score, fsj["count"]
+            fsj_possible = int(fsj_score < species_scores["review_below"])
         meta = cuddeback_exif.read_photo_metadata(path)
         has_thumb = make_thumbnail(path, image_id)
 
@@ -748,6 +794,7 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
         camelot = camelot_fields(filename, ai_species, ai_is_group, sightings)
         cols = ("id", "job_id", "folder", "filename", "stem", "position", *exif_cols,
                 "captured_at", "time_source", "diel_period", "ai_species", "ai_is_group", "ai_conf", "ai_det_conf",
+                "speciesnet_species", "fsj_score", "fsj_possible",
                 "camelot_species", "camelot_agreement", "band_id",
                 "display_species", "count", "has_thumbnail", "created_at")
         values = (image_id, job_id, str(folder), filename, photo_stem(filename), position_for(filename, positions),
@@ -755,17 +802,20 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
                   captured_at, time_source, compute_diel_period(captured_at), ai_species, ai_is_group,
                   round(ai_conf, 3) if ai_conf is not None else None,
                   round(ai_det_conf, 3) if ai_det_conf is not None else None,
+                  speciesnet_species, round(fsj_score, 4) if fsj_score is not None else None, fsj_possible,
                   camelot["camelot_species"], camelot["camelot_agreement"], camelot["jay_ids"],
                   display, ai_count, int(has_thumb), now_iso())
         # On reprocessing, refresh machine-derived fields only; human edits
         # (corrections, count, notes, band ID, review flag) are left alone.
+        # A photo SpeciesNet is seeing for the first time has no real count yet.
         refresh = (*exif_cols, "captured_at", "time_source", "diel_period", "ai_species", "ai_is_group",
-                   "ai_conf", "ai_det_conf", "camelot_species", "camelot_agreement", "display_species",
-                   "has_thumbnail")
+                   "ai_conf", "ai_det_conf", "speciesnet_species", "fsj_score", "fsj_possible",
+                   "camelot_species", "camelot_agreement", "display_species", "has_thumbnail")
         with db.transaction() as conn:
             conn.execute(
                 f"""INSERT INTO images({", ".join(cols)}) VALUES({", ".join("?" * len(cols))})
-                    ON CONFLICT(id) DO UPDATE SET {", ".join(f"{c} = excluded.{c}" for c in refresh)}""",
+                    ON CONFLICT(id) DO UPDATE SET {", ".join(f"{c} = excluded.{c}" for c in refresh)},
+                        count = CASE WHEN images.ai_species = '{NOT_CLASSIFIED}' THEN excluded.count ELSE images.count END""",
                 values)
     if undated:
         log.write(f"{undated} photo(s) had no EXIF capture time (not original camera files?) "
@@ -786,6 +836,7 @@ IMAGE_PUBLIC_FIELDS = (
     "corrected_at", "display_species", "count", "notes", "band_id", "marked_for_review",
     "metadata_edited", "has_thumbnail", "hardware_id", "battery", "battery_source", "trigger",
     "camera_model", "firmware", "exif_comment", "camelot_species", "camelot_agreement",
+    "speciesnet_species", "fsj_score", "fsj_possible",
 )
 
 
@@ -815,6 +866,7 @@ def species_taxonomy():
     labels = {r["label"] for r in db.query("SELECT label FROM species")}
     labels |= {r["display_species"] for r in db.query("SELECT DISTINCT display_species FROM images")}
     labels.add("blank")
+    labels.discard(NOT_CLASSIFIED)  # not something to correct a photo to
     return jsonify(sorted(labels, key=str.lower))
 
 
@@ -875,13 +927,15 @@ def get_image(image_id):
 @app.route("/api/camelot/compare")
 def camelot_compare():
     """Library photos per Camelot species, by how the AI's label compares. A
-    photo with sightings of two species counts under both."""
+    photo with sightings of two species counts under both. Photos with no AI
+    answer to compare don't count, or a species' total would look badly missed."""
     species = {}
     for r in db.query(
             """SELECT s.species, i.camelot_agreement AS agreement,
                       COALESCE(i.ai_species, 'blank') AS ai, COUNT(DISTINCT i.id) AS n
                FROM images i JOIN camelot_sightings s ON s.stem = i.stem
-               GROUP BY s.species, agreement, ai"""):
+               WHERE COALESCE(i.ai_species, '') != ? OR i.camelot_agreement IS NOT NULL
+               GROUP BY s.species, agreement, ai""", (NOT_CLASSIFIED,)):
         row = species.setdefault(r["species"], {"species": r["species"], "agree": 0, "group": 0, "differ": 0,
                                                 "total": 0, "called": collections.Counter()})
         row["total"] += r["n"]

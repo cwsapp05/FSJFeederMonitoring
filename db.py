@@ -121,7 +121,10 @@ ADDED_COLUMNS = {
                "stem TEXT",                # lowercase file name without extension; joins camelot_sightings
                "ai_is_group INTEGER DEFAULT 0",  # ai_species is a broad group ("bird"), not a species
                "camelot_species TEXT",     # the photo's Camelot species, comma-separated
-               "camelot_agreement TEXT"],  # agree | group | differ | NULL = nothing to compare
+               "camelot_agreement TEXT",   # agree | group | differ | NULL = nothing to compare
+               "speciesnet_species TEXT",  # SpeciesNet's own answer, kept when the scrub-jay model overrides it
+               "fsj_score REAL",           # scrub-jay model score; NULL if the photo wasn't scored
+               "fsj_possible INTEGER DEFAULT 0"],  # called a scrub-jay, but with a score worth checking
     "jobs": ["done_count INTEGER DEFAULT 0"],
 }
 
