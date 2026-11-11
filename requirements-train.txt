@@ -1,0 +1,9 @@
+# Separate GPU environment for training and for the scrub-jay step in the pipeline. With Python 3.11:
+#   py -3.11 -m venv .venv-train
+#   .venv-train\Scripts\python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+#   .venv-train\Scripts\python -m pip install -r requirements-train.txt
+#   .venv-train\Scripts\python -m pip install --only-binary=:all: onnx
+#   .venv-train\Scripts\python -m pip install --no-deps onnx2torch==1.5.15
+# onnx and onnx2torch are needed to load SpeciesNet. onnx2torch's normal install tried to build onnx from
+# source and failed on Python 3.11, so these two are installed separately.
+megadetector

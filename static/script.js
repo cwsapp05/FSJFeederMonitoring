@@ -350,9 +350,16 @@ const viewer = {
     const r = this.rec = await api(`/api/images/${id}`);
     $("v-species").textContent = r.display_species;
     $("v-species").style.color = speciesColor(r.display_species);
-    $("v-ai").textContent = r.ai_species
-      ? `AI: ${r.ai_species} (${Math.round((r.ai_conf || 0) * 100)}% classifier, ${Math.round((r.ai_det_conf || 0) * 100)}% detector)`
-      : "AI: blank (no animal detected)";
+    if (r.ai_species === "florida scrub-jay") {
+      const speciesNet = r.speciesnet_species === "not classified" ? "SpeciesNet hasn't run on this photo." : `SpeciesNet said ${r.speciesnet_species || "blank"}.`;
+      $("v-ai").textContent = `AI: florida scrub-jay${r.fsj_possible ? " (possible, please check)" : ""}, scrub-jay model ${(r.fsj_score * 100).toFixed(1)}%. ${speciesNet}`;
+    } else if (r.ai_species === "not classified") {
+      $("v-ai").textContent = `AI: not classified. Under the cutoff for the scrub-jay model (${(r.fsj_score * 100).toFixed(1)}%), and SpeciesNet hasn't run on this photo.`;
+    } else {
+      $("v-ai").textContent = r.ai_species
+        ? `AI: ${r.ai_species} (${Math.round((r.ai_conf || 0) * 100)}% classifier, ${Math.round((r.ai_det_conf || 0) * 100)}% detector)`
+        : "AI: blank (no animal detected)";
+    }
     const verdict = { agree: "AI agrees", group: "AI only gave a group", differ: "AI disagrees" }[r.camelot_agreement];
     $("v-camelot").textContent = r.camelot_sightings.length
       ? `Camelot: ${r.camelot_sightings.map((s) => s.species + (s.quantity > 1 ? ` ×${s.quantity}` : "") + (s.jay_id ? ` (${s.jay_id})` : "")).join("; ")}${verdict ? ` · ${verdict}` : ""}`

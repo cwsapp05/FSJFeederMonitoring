@@ -50,6 +50,46 @@ How a photo is compared:
 
 **Which columns are used.** `full_filtered.csv` has two copies of the label columns. `Genus`, `Species`, `Sighting Quantity`, `Jay ID` and `Life stage` are unreliable on photos with several sightings: they repeat one sighting and lose the others. Checked against `CamelotExport__101426.xlsx`, they're wrong on 721 of the 36,040 photos. `Species Common Name` and the `(paths file)` columns match that export on every photo, so those are the ones imported. A plain Camelot export, without `(paths file)` columns, works too.
 
+## The scrub-jay model
+
+SpeciesNet's label list has no Florida Scrub-Jay, so it mostly answers `bird` or `corvidae family`. A one-vs-all model trained on the Camelot labels runs after it. If `models/florida_scrub_jay.pt` is missing, the pipeline uses SpeciesNet alone.
+
+- It scores each detector box and the whole photo, and a photo's score is the highest of these. At or above the threshold (0.848), the AI label becomes `florida scrub-jay`. Otherwise SpeciesNet's label stands. Your corrections are never replaced.
+- SpeciesNet's own answer and the model's score are stored on every scored photo and shown in the viewer. A call scoring under 0.99 says **possible, please check**: on validation data, 42% of those were false, against 1% above it.
+- The count on a call is rough: 75% exact against Camelot's quantity, 95% within one.
+- It needs about 5 crops per photo, so run it on a GPU. The app uses `.venv-train` when it exists, or `SPECIES_MODEL_PYTHON` to name another Python. Setup is at the top of `requirements-train.txt`.
+
+**How it did**, with the threshold set for 98% recall on validation data:
+
+| Test | Scrub-jay photos | Recall | Precision | Other photos wrongly flagged |
+|---|---:|---:|---:|---:|
+| Held-out one-hour blocks (test set) | 1,620 | 98.3% | 98.3% | 0.8% |
+| Trained before March, tested on March and September | 2,604 | 97.3% | 69.9% | 5.6% |
+| Trained January to March, tested on September | 28 | 96.4% | 6.9% | 6.7% |
+
+Expect the time-based rows on future photos, not the first. False alarms rise when birds or seasons appear that training hasn't seen, and most of them are White-winged Doves (never in the first two training sets) and Common Grackles. Recall has barely been tested outside January to March, and no scrub-jay in the data is labeled as a juvenile. Retraining with newly labeled photos should help, especially with false alarms.
+
+The **AI vs Camelot** table overstates accuracy on these 36,040 photos, because the model trained on 70% of them. Use it as a true measure only on new photos.
+
+**Retraining:**
+
+```
+.venv-train\Scripts\python training\detect.py --photos <folder>
+.venv-train\Scripts\python training\extract.py --photos <folder> --workers 2
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --evaluate-test
+.venv-train\Scripts\python training\diagnose.py --csv <camelot.csv> --photos <folder>
+```
+
+Photos are grouped into one-hour blocks per station, each starting at its first photo, and whole blocks go to train, validation or test. The camera's info bar is blacked out so a model can't read dates or camera IDs from it. `train.py` picks its settings on validation data and only scores the test set with `--evaluate-test`, so use that flag once per dataset. It replaces `models/florida_scrub_jay.pt`, whose `review_below` value comes from `REVIEW_BELOW`. Check the score bands again after retraining, because that value and the threshold depend on the model. `diagnose.py` checks whether the model is seeing the bird or the scene around it. Intermediate files go in `runs/species_training/`.
+
+**Labeling the workspace from saved features:**
+
+```
+.venv\Scripts\python training\relabel_library.py
+```
+
+This applies the model in minutes, without rerunning the pipeline. It backs up the database to `runs/fsj-before-relabel-<date>.db` first, and photos that already have a score are left alone, so it can be rerun. Photos the pipeline hadn't reached are added without a SpeciesNet answer, and those the model doesn't call show as `not classified`. They count as unprocessed, so **Process remaining** still runs SpeciesNet on them later and keeps your edits. Until then, only a jay Camelot has that the model missed counts in the **AI vs Camelot** table among them.
+
 ## Where photo metadata comes from
 
 Cuddeback cameras write everything into each JPEG's EXIF, and `cuddeback_exif.py` reads it from there (there's no OCR):
@@ -148,6 +188,8 @@ app.py              Flask backend: workspace, job queue, library, Log + timeline
 db.py               SQLite schema and helpers
 cuddeback_exif.py   reads date/time, camera name and other fields from Cuddeback EXIF
 log_import.py       Log workbook → timeline events
+models/             trained one-vs-all species models
+training/           training, evaluation and the scoring step the app runs
 wsgi.py, gunicorn.conf.py, serve_windows.py   production entry points
 templates/index.html, static/script.js, static/style.css   frontend (no build step)
 ```
