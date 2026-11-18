@@ -246,7 +246,30 @@ def main():
     ap.add_argument("--species", default="Florida Scrub-Jay")
     ap.add_argument("--slug", default="florida_scrub_jay")
     ap.add_argument("--evaluate-test", action="store_true", help="Score the test set. Only do this once the configuration is settled.")
+    ap.add_argument("--recall-target", type=float, default=RECALL_TARGET)
+    ap.add_argument("--threshold-on", choices=("all", "alone"), default="all",
+                    help="Which validation photos of the species set the threshold. 'alone': only those where it's the "
+                         "only species labelled, because a bird hidden behind another often isn't visible at all.")
+    ap.add_argument("--always-check", action="store_true", help="Mark every call from this model 'possible, please check'.")
     args = ap.parse_args()
+
+    def alone_mask(keep, y):
+        """Negatives, plus the photos where the species is the only one labelled."""
+        return np.array([label == 0 or set(photos[k]["species"]) == {args.species} for k, label in zip(keep, y)], dtype=bool)
+
+    def set_threshold(keep, s, y):
+        """The threshold for the recall target, or None if there's no photo of the species to set it on."""
+        if args.threshold_on == "alone":
+            m = alone_mask(keep, y)
+            s, y = s[m], y[m]
+        return threshold_for_recall(s, y, args.recall_target) if (y == 1).any() else None
+
+    def with_alone(result, keep, s, y, threshold):
+        """Adds recall on the photos where the species is the only one labelled, next to recall on all of them."""
+        m = alone_mask(keep, y)
+        alone = metrics(s[m], y[m], threshold)
+        result["species_alone"] = dict(present=int((y[m] == 1).sum()), recall=alone["recall"], tp=alone["tp"], fn=alone["fn"])
+        return result
 
     photos = load_dataset(args.csv)
     labels = photo_labels(photos, args.species)
@@ -272,27 +295,32 @@ def main():
         for floor in (0.005, 0.01, 0.02, 0.05, 0.1):
             for use_frame in (False, True):
                 keep, s, y = arrays_for(stems_in["val"], photo_scores(data, box_sc, frame_sc, floor, use_frame), labels)
-                th = threshold_for_recall(s, y, RECALL_TARGET)
+                th = set_threshold(keep, s, y)
                 m = metrics(s, y, th)
                 results.append(dict(hidden=hidden, weight_decay=wd, floor=floor, use_frame=use_frame, threshold=th, **m))
                 print(f"hidden={hidden} wd={wd} floor={floor} frame={use_frame}: recall {m['recall']:.4f} precision {m['precision']:.4f} fpr {m['false_positive_rate']:.4f} th {th:.4f}", flush=True)
     best = max(results, key=lambda r: (r["precision"], -r["floor"]))
     print("chosen on validation:", best, flush=True)
 
-    # SpeciesNet alone: its raw California Scrub-Jay score, as the baseline to beat.
-    california_map = photo_scores(data, data["california"], data["california"], best["floor"], False)
-    keep, s, y = arrays_for(stems_in["val"], california_map, labels)
-    th = threshold_for_recall(s, y, RECALL_TARGET)
-    baseline = dict(name="SpeciesNet raw California Scrub-Jay score", threshold=th, **metrics(s, y, th))
-    print("baseline:", baseline, flush=True)
+    # SpeciesNet alone: its raw California Scrub-Jay score, as the baseline to beat. extract.py saves only
+    # that one SpeciesNet score, so other species have no baseline here.
+    baseline = None
+    if args.species == "Florida Scrub-Jay":
+        california_map = photo_scores(data, data["california"], data["california"], best["floor"], False)
+        keep, s, y = arrays_for(stems_in["val"], california_map, labels)
+        th = threshold_for_recall(s, y, RECALL_TARGET)
+        baseline = dict(name="SpeciesNet raw California Scrub-Jay score", threshold=th, **metrics(s, y, th))
+        print("baseline:", baseline, flush=True)
 
     box_head, frame_head = train_pair(train_mask, best["hidden"], best["weight_decay"])
     box_sc, frame_sc = scores_of(box_head, data["feature"]), scores_of(frame_head, data["feature"])
     score_map = photo_scores(data, box_sc, frame_sc, best["floor"], best["use_frame"])
     val_keep, val_s, val_y = arrays_for(stems_in["val"], score_map, labels)
-    threshold = threshold_for_recall(val_s, val_y, RECALL_TARGET)
+    threshold = set_threshold(val_keep, val_s, val_y)
     report = dict(species=args.species, chosen=best, baseline_on_val=baseline, all_val_results=results,
-                  val=evaluate("val", val_keep, val_s, val_y, photos, threshold, args.species))
+                  recall_target=args.recall_target, threshold_on=args.threshold_on, always_check=args.always_check,
+                  val=with_alone(evaluate("val", val_keep, val_s, val_y, photos, threshold, args.species),
+                                 val_keep, val_s, val_y, threshold))
 
     # For looking at mistakes and picking a lower threshold band.
     review = [dict(stem=s, score=float(v), label=int(l), station=photos[s]["station"], species=dict(photos[s]["species"]))
@@ -301,7 +329,7 @@ def main():
 
     if args.evaluate_test:
         k, s, y = arrays_for(stems_in["test"], score_map, labels)
-        report["test"] = evaluate("test", k, s, y, photos, threshold, args.species)
+        report["test"] = with_alone(evaluate("test", k, s, y, photos, threshold, args.species), k, s, y, threshold)
         report["test_excluding_near_boundary"] = boundary_check(k, s, y, photos, threshold, "test")
         review = [dict(stem=a, score=float(v), label=int(l), station=photos[a]["station"], species=dict(photos[a]["species"])) for a, v, l in zip(k, s, y)]
         (WORK_DIR / f"{args.slug}_test_scores.json").write_text(json.dumps(review))
@@ -317,15 +345,21 @@ def main():
             sm = photo_scores(data, b_sc, f_sc, best["floor"], best["use_frame"])
             past_val = [s for s in stems_in["val"] if first[photos[s]["block"]] < cut]
             k, s, y = arrays_for(past_val, sm, labels)
-            th = threshold_for_recall(s, y, RECALL_TARGET)
+            th = set_threshold(k, s, y)
+            if th is None:
+                # Nothing to set a threshold on, e.g. a species only seen in September.
+                report[name] = f"skipped: no {args.species} in validation photos before {cut:%Y-%m-%d}"
+                continue
             future = sorted({s for s in data["stem"].tolist() if first[photos[s]["block"]] >= cut})
             k, s, y = arrays_for(future, sm, labels)
-            report[name] = evaluate(name, k, s, y, photos, th, args.species)
+            report[name] = with_alone(evaluate(name, k, s, y, photos, th, args.species), k, s, y, th)
 
         MODELS_DIR.mkdir(exist_ok=True)
         torch.save({"species": args.species, "hidden": best["hidden"], "state_box": box_head.cpu().state_dict(),
                     "state_frame": frame_head.cpu().state_dict(), "use_frame": best["use_frame"], "floor": best["floor"],
-                    "threshold": threshold, "review_below": REVIEW_BELOW, "recall_target": RECALL_TARGET,
+                    # A review cutoff above 1 means every call asks for a check.
+                    "threshold": threshold, "review_below": 1.01 if args.always_check else REVIEW_BELOW,
+                    "recall_target": args.recall_target, "threshold_on": args.threshold_on,
                     "seed_split": "fsj-v1", "feature_layer": "SpeciesNet avg_pool"}, MODELS_DIR / f"{args.slug}.pt")
 
     (WORK_DIR / f"{args.slug}_report.json").write_text(json.dumps(report, indent=1, default=str))
