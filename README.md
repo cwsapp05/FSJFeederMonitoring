@@ -50,26 +50,55 @@ How a photo is compared:
 
 **Which columns are used.** `full_filtered.csv` has two copies of the label columns. `Genus`, `Species`, `Sighting Quantity`, `Jay ID` and `Life stage` are unreliable on photos with several sightings: they repeat one sighting and lose the others. Checked against `CamelotExport__101426.xlsx`, they're wrong on 721 of the 36,040 photos. `Species Common Name` and the `(paths file)` columns match that export on every photo, so those are the ones imported. A plain Camelot export, without `(paths file)` columns, works too.
 
-## The scrub-jay model
+## The species models
 
-SpeciesNet's label list has no Florida Scrub-Jay, so it mostly answers `bird` or `corvidae family`. A one-vs-all model trained on the Camelot labels runs after it. If `models/florida_scrub_jay.pt` is missing, the pipeline uses SpeciesNet alone.
+SpeciesNet often names a feeder bird only as a group. It has no Florida Scrub-Jay label, so it mostly answers `bird` or `corvidae family`. It has labels for the other species here but rarely uses them: on the grackle photos it said `bird` 3,108 times and `common grackle` 7 times. One-vs-all models trained on the Camelot labels run after it, one per species, listed in `SPECIES_MODELS` in `app.py`: Florida Scrub-Jay, Common Grackle, White-winged Dove, Blue Jay, Red-bellied Woodpecker, Northern Mockingbird and Northern Cardinal. A model whose file in `models/` is missing is skipped, and with none the pipeline uses SpeciesNet alone.
 
-- It scores each detector box and the whole photo, and a photo's score is the highest of these. At or above the threshold (0.848), the AI label becomes `florida scrub-jay`. Otherwise SpeciesNet's label stands. Your corrections are never replaced.
-- SpeciesNet's own answer and the model's score are stored on every scored photo and shown in the viewer. A call scoring under 0.99 says **possible, please check**: on validation data, 42% of those were false, against 1% above it.
-- The count on a call is rough: 75% exact against Camelot's quantity, 95% within one.
-- It needs about 5 crops per photo, so run it on a GPU. The app uses `.venv-train` when it exists, or `SPECIES_MODEL_PYTHON` to name another Python. Setup is at the top of `requirements-train.txt`.
+- Each model scores each detector box and the whole photo, and a photo's score is the highest of these. A score at or above the model's threshold changes the AI label to that species. Otherwise SpeciesNet's label stands. Your corrections are never replaced.
+- When more than one model calls a photo, the highest score wins and the photo is marked **possible, please check**. With the scrub-jay and grackle models this happened on about 0.4% of photos, and the higher score was right on 27 of the 31 single-species ones in validation and test.
+- A call scoring under 0.99 also says **possible, please check**: on validation data, 42% of the scrub-jay calls and 34% of the grackle calls in that band were false, against 1% and 0.5% above it. Every cardinal call asks for a check, because its figures rest on about 20 held-out photos, and so does every mockingbird call, because a quarter of them were wrong on the test set.
+- SpeciesNet's own answer and every model's score are stored on each scored photo and shown in the viewer.
+- The count on a call is rough. For scrub-jays it was 75% exact against Camelot's quantity and 95% within one. Camelot gives nearly every other bird a quantity of 1, so their counts haven't been checked.
+- Each photo's crops go through SpeciesNet once, and every model scores the same features. That's about 5 crops per photo, so run it on a GPU. The app uses `.venv-train` when it exists, or `SPECIES_MODEL_PYTHON` to name another Python. Setup is at the top of `requirements-train.txt`.
 
-**How it did**, with the threshold set for 98% recall on validation data:
+**How they did on held-out one-hour blocks (the test set):**
 
-| Test | Scrub-jay photos | Recall | Precision | Other photos wrongly flagged |
-|---|---:|---:|---:|---:|
-| Held-out one-hour blocks (test set) | 1,620 | 98.3% | 98.3% | 0.8% |
-| Trained before March, tested on March and September | 2,604 | 97.3% | 69.9% | 5.6% |
-| Trained January to March, tested on September | 28 | 96.4% | 6.9% | 6.7% |
+| Model | Threshold | Photos of the species | Recall | Precision | Other photos wrongly flagged |
+|---|---:|---:|---:|---:|---:|
+| Scrub-jay | 0.848 | 1,620 | 98.3% | 98.3% | 0.8% |
+| Grackle | 0.923 | 1,176 | 97.5% | 98.8% | 0.4% |
+| White-winged Dove | 0.9998 | 191 | 97.4% | 95.9% | 0.2% |
+| Red-bellied Woodpecker | 0.908 | 156 | 96.8% | 96.8% | 0.1% |
+| Northern Mockingbird | 0.989 | 55 | 89.1% | 76.6% | 0.3% |
+| Blue Jay | 0.987 | 40 | 87.5% | 100% | 0% |
+| Northern Cardinal | 0.845 | 11 | 90.9% | 83.3% | 0.04% |
 
-Expect the time-based rows on future photos, not the first. False alarms rise when birds or seasons appear that training hasn't seen, and most of them are White-winged Doves (never in the first two training sets) and Common Grackles. Recall has barely been tested outside January to March, and no scrub-jay in the data is labeled as a juvenile. Retraining with newly labeled photos should help, especially with false alarms.
+**Trained on earlier photos, tested on later ones** (closer to what to expect on new photos):
 
-The **AI vs Camelot** table overstates accuracy on these 36,040 photos, because the model trained on 70% of them. Use it as a true measure only on new photos.
+| Model | Test | Photos of the species | Recall | Precision | Other photos wrongly flagged |
+|---|---|---:|---:|---:|---:|
+| Scrub-jay | Trained before March, tested on March and September | 2,604 | 97.3% | 69.9% | 5.6% |
+| Scrub-jay | Trained January to March, tested on September | 28 | 96.4% | 6.9% | 6.7% |
+| Grackle | Trained before March, tested on March and September | 8,331 | 87.2% | 97.1% | 1.6% |
+| Grackle | Trained January to March, tested on September | 2,962 | 97.5% | 86.2% | 18.7% |
+| Red-bellied Woodpecker | Trained before March, tested on March and September | 581 | 94.7% | 54.7% | 2.1% |
+| Red-bellied Woodpecker | Trained January to March, tested on September | 107 | 83.2% | 88.1% | 0.2% |
+| Northern Mockingbird | Trained before March, tested on March and September | 154 | 79.2% | 17.2% | 2.7% |
+| Blue Jay | Trained before March, tested on March and September | 110 | 85.5% | 87.0% | 0.1% |
+| Northern Cardinal | Trained before March, tested on March and September | 58 | 50.0% | 96.7% | 0% |
+
+White-winged Doves appear only in September, so the dove model has no time-based test. Rows with fewer than 10 photos of the species are left out.
+
+Expect the time-based rows on future photos, not the test set. False alarms rise when birds or seasons appear that training hasn't seen. For the scrub-jay model most are White-winged Doves (never in the first two training sets) and Common Grackles. For the grackle model they are crows and White-winged Doves: crows appear only in September, and a grackle model trained without them called 84 to 96% of them grackles. The full model has seen September's crows, but only 18 of them were held out to test it, so watch grackle calls on crows. Grackles before March are scarce (514 photos, all in February), which is why that row's recall is lower. Mockingbird calls are the least reliable: a quarter were wrong on the test set, and far more when trained on earlier photos. Scrub-jay recall has barely been tested outside January to March, and no scrub-jay in the data is labeled as a juvenile. Retraining with newly labeled photos should help, especially with false alarms.
+
+The thresholds for scrub-jay, grackle and dove aim to catch 98% of the species on validation photos. The other four aim for 95%, counting only validation photos where the species is the only one labelled. Camelot records a species for a whole visit, so a woodpecker hidden behind the feeder, or behind a jay in front of it, is still labelled even when no model could see it. The recall columns count those photos too.
+
+**Not modelled yet:**
+- Crow sp. A model was trained, but its 10 validation crows came from two fogged-lens visits, so its threshold fell to almost zero and it called many grackles crows (7% precision on the test set). It's kept in `runs/species_training/rejected/`.
+- Gray Catbird, Red-headed Woodpecker, Eastern Towhee, Brown Thrasher and American Kestrel have 1 to 13 labelled photos each. That's too few to train a model or measure one.
+- `training/train_multi.py` tried a single model covering all the species at once. It made scrub-jay false alarms about four times as common (63 grackles called jays on the test set), so the separate models are used instead.
+
+The **AI vs Camelot** table overstates accuracy on these 36,040 photos, because the models trained on 70% of them. Use it as a true measure only on new photos.
 
 **Retraining:**
 
@@ -77,10 +106,16 @@ The **AI vs Camelot** table overstates accuracy on these 36,040 photos, because 
 .venv-train\Scripts\python training\detect.py --photos <folder>
 .venv-train\Scripts\python training\extract.py --photos <folder> --workers 2
 .venv-train\Scripts\python training\train.py --csv <camelot.csv> --evaluate-test
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --species "Common Grackle" --slug common_grackle --evaluate-test
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --species "White-Winged Dove" --slug white_winged_dove --evaluate-test
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --species "Blue Jay" --slug blue_jay --recall-target 0.95 --threshold-on alone --evaluate-test
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --species "Red-Bellied Woodpecker" --slug red_bellied_woodpecker --recall-target 0.95 --threshold-on alone --evaluate-test
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --species "Northern Mockingbird" --slug northern_mockingbird --recall-target 0.95 --threshold-on alone --always-check --evaluate-test
+.venv-train\Scripts\python training\train.py --csv <camelot.csv> --species "Northern Cardinal" --slug northern_cardinal --recall-target 0.95 --threshold-on alone --always-check --evaluate-test
 .venv-train\Scripts\python training\diagnose.py --csv <camelot.csv> --photos <folder>
 ```
 
-Photos are grouped into one-hour blocks per station, each starting at its first photo, and whole blocks go to train, validation or test. The camera's info bar is blacked out so a model can't read dates or camera IDs from it. `train.py` picks its settings on validation data and only scores the test set with `--evaluate-test`, so use that flag once per dataset. It replaces `models/florida_scrub_jay.pt`, whose `review_below` value comes from `REVIEW_BELOW`. Check the score bands again after retraining, because that value and the threshold depend on the model. `diagnose.py` checks whether the model is seeing the bird or the scene around it. Intermediate files go in `runs/species_training/`.
+Photos are grouped into one-hour blocks per station, each starting at its first photo, and whole blocks go to train, validation or test. The camera's info bar is blacked out so a model can't read dates or camera IDs from it. `train.py` picks its settings on validation data and only scores the test set with `--evaluate-test`, so use that flag once per dataset and species. It replaces `models/<slug>.pt` (`florida_scrub_jay` by default), whose `review_below` value comes from `REVIEW_BELOW` (or is set above 1 by `--always-check`, so every call asks for a check). `--recall-target` sets the share of the species the threshold aims to catch, and `--threshold-on alone` sets it only on validation photos where the species is the only one labelled. All models share the saved features and the same block split. A new species needs an entry in `SPECIES_MODELS` and a score column in `db.py`. Check the score bands again after retraining, because that value and the threshold depend on the model. `diagnose.py` checks whether the model is seeing the bird or the scene around it. Intermediate files go in `runs/species_training/`.
 
 **Labeling the workspace from saved features:**
 
@@ -88,7 +123,7 @@ Photos are grouped into one-hour blocks per station, each starting at its first 
 .venv\Scripts\python training\relabel_library.py
 ```
 
-This applies the model in minutes, without rerunning the pipeline. It backs up the database to `runs/fsj-before-relabel-<date>.db` first, and photos that already have a score are left alone, so it can be rerun. Photos the pipeline hadn't reached are added without a SpeciesNet answer, and those the model doesn't call show as `not classified`. They count as unprocessed, so **Process remaining** still runs SpeciesNet on them later and keeps your edits. Until then, only a jay Camelot has that the model missed counts in the **AI vs Camelot** table among them.
+This applies the models in minutes, without rerunning the pipeline. It backs up the database to `runs/fsj-before-relabel-<date>.db` first. Photos that already have a score from every model are left alone, so it can be rerun, and after a new model is added it scores every photo with it. Photos the pipeline hadn't reached are added without a SpeciesNet answer, and those no model calls show as `not classified`. They count as unprocessed, so **Process remaining** still runs SpeciesNet on them later and keeps your edits. Until then, among those photos only a species that has a model, that Camelot has and the models missed, counts in the **AI vs Camelot** table.
 
 ## Where photo metadata comes from
 

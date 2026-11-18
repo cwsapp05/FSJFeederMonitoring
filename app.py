@@ -77,11 +77,23 @@ PROCESS_BATCH_SIZE = int(os.environ.get("PROCESS_BATCH_SIZE", "500"))
 # also uses.
 DETECTOR_MODEL = "MDV5A"
 DETECTOR_OUTPUT_THRESHOLD = "0.005"
-# Runs after SpeciesNet, whose label list has no Florida Scrub-Jay. See training/.
-SPECIES_MODEL = BASE_DIR / "models" / "florida_scrub_jay.pt"
-SPECIES_MODEL_LABEL = "florida scrub-jay"
+# One-vs-all models that run after SpeciesNet, for species it can't name (no Florida
+# Scrub-Jay label) or rarely does (common grackle comes out as "bird"). See training/.
+# A model whose file is missing is skipped. Each stores its score in its own column.
+SPECIES_MODELS = (
+    {"label": "florida scrub-jay", "file": BASE_DIR / "models" / "florida_scrub_jay.pt", "column": "fsj_score"},
+    {"label": "common grackle", "file": BASE_DIR / "models" / "common_grackle.pt", "column": "grackle_score"},
+    {"label": "white-winged dove", "file": BASE_DIR / "models" / "white_winged_dove.pt", "column": "dove_score"},
+    {"label": "blue jay", "file": BASE_DIR / "models" / "blue_jay.pt", "column": "blue_jay_score"},
+    {"label": "red-bellied woodpecker", "file": BASE_DIR / "models" / "red_bellied_woodpecker.pt", "column": "woodpecker_score"},
+    {"label": "northern mockingbird", "file": BASE_DIR / "models" / "northern_mockingbird.pt", "column": "mockingbird_score"},
+    {"label": "northern cardinal", "file": BASE_DIR / "models" / "northern_cardinal.pt", "column": "cardinal_score"},
+)
+# Only models with a file have judged a photo, so only they can have missed a species on it.
+SPECIES_MODEL_LABELS = {m["label"] for m in SPECIES_MODELS if m["file"].exists()}
+SPECIES_SCORE_COLUMNS = tuple(m["column"] for m in SPECIES_MODELS)
 # Stands in for an answer on photos SpeciesNet hasn't seen (training/relabel_library.py
-# adds these). Stored in speciesnet_species, and in ai_species unless the scrub-jay
+# adds these). Stored in speciesnet_species, and in ai_species unless a species
 # model called the photo. Unlike "blank", it doesn't claim the photo is empty.
 NOT_CLASSIFIED = "not classified"
 
@@ -243,8 +255,8 @@ def camelot_agreement(sightings, ai_species, ai_is_group):
     if not labels:
         return None
     if ai_species == NOT_CLASSIFIED:
-        # Only the scrub-jay model has seen this photo, and it said no.
-        return "differ" if SPECIES_MODEL_LABEL in labels else None
+        # Only the species models have seen this photo, and they all said no.
+        return "differ" if labels & SPECIES_MODEL_LABELS else None
     ai = (ai_species or "blank").lower()
     if ai in labels or ("crow sp." in labels and ai.endswith(" crow")):
         return "agree"
@@ -512,8 +524,32 @@ def _scores_file(predictions):
     return predictions.with_name(predictions.name.replace("predictions-", "scores-"))
 
 
+def read_species_scores(path):
+    """{label: {"threshold", "review_below", "photos"}} from score_photos.py's output, or {}."""
+    if not path.exists():
+        return {}
+    data = json.loads(path.read_text(encoding="utf-8"))
+    models = data["models"] if "models" in data else [data]  # older files held one model
+    return {m.get("species", "Florida Scrub-Jay").lower(): m for m in models}
+
+
+def species_model_call(results):
+    """Which species model calls a photo. results: {label: (score, count, threshold, review_below)}.
+
+    Returns (label, score, count, possible) or None. The highest score at or above its own
+    threshold wins. The call is worth checking when its score is under review_below, or
+    when another model also called the photo.
+    """
+    calls = sorted(((score, label, count, review_below) for label, (score, count, threshold, review_below)
+                    in results.items() if score >= threshold), reverse=True)
+    if not calls:
+        return None
+    score, label, count, review_below = calls[0]
+    return label, score, count, int(score < review_below or len(calls) > 1)
+
+
 def species_model_python():
-    """The scrub-jay step needs PyTorch and uses a GPU if there is one, so it
+    """The species-model step needs PyTorch and uses a GPU if there is one, so it
     prefers the training environment (see README) over this app's environment."""
     override = os.environ.get("SPECIES_MODEL_PYTHON")
     if override:
@@ -525,8 +561,8 @@ def species_model_python():
 
 
 def _run_pipeline(job_id, folder, batch, log):
-    """Runs MegaDetector, then SpeciesNet on its detections, then the scrub-jay
-    model if there is one. The combined pipeline command can only take a whole
+    """Runs MegaDetector, then SpeciesNet on its detections, then the species
+    models there are files for. The combined pipeline command can only take a whole
     folder, while the detector can take a list of files, which is what lets the
     photos stay in one folder. Returns the predictions file, or None if a step
     failed or was cancelled."""
@@ -550,12 +586,14 @@ def _run_pipeline(job_id, folder, batch, log):
     try:
         if not (_run_step(job_id, detect, log) and not _is_cancelling(job_id) and _run_step(job_id, classify, log)):
             return None
-        if SPECIES_MODEL.exists() and not _is_cancelling(job_id):
+        models = [m["file"] for m in SPECIES_MODELS if m["file"].exists()]
+        if models and not _is_cancelling(job_id):
             scores = _scores_file(predictions)
             scores.unlink(missing_ok=True)
             score = [species_model_python(), str(BASE_DIR / "training" / "score_photos.py"),
-                     "--predictions", str(predictions), "--folder", folder,
-                     "--model", str(SPECIES_MODEL), "--out", str(scores)]
+                     "--predictions", str(predictions), "--folder", folder, "--out", str(scores)]
+            for path in models:
+                score += ["--model", str(path)]
             if not _run_step(job_id, score, log):
                 return None
         return predictions
@@ -740,14 +778,13 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
     data = json.loads(predictions_file.read_text(encoding="utf-8"))
     class_cats = data.get("classification_categories", {})
     group_labels = _group_labels(data)
-    scores_path = _scores_file(predictions_file)
-    species_scores = json.loads(scores_path.read_text(encoding="utf-8")) if scores_path.exists() else None
+    species_scores = read_species_scores(_scores_file(predictions_file))
+    column_of = {m["label"]: m["column"] for m in SPECIES_MODELS}
 
     with db.transaction() as conn:
         conn.executemany("INSERT OR IGNORE INTO species(label) VALUES(?)",
                          [(label,) for label in class_cats.values()])
-        if species_scores:
-            conn.execute("INSERT OR IGNORE INTO species(label) VALUES(?)", (SPECIES_MODEL_LABEL,))
+        conn.executemany("INSERT OR IGNORE INTO species(label) VALUES(?)", [(label,) for label in species_scores])
 
     folder = Path(folder)
     entries = data.get("images", [])
@@ -768,12 +805,17 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
         image_id = image_id_for(filename)
         ai_species, ai_conf, ai_det_conf, ai_count = _best_species(img.get("detections") or [], class_cats)
         speciesnet_species = ai_species
-        fsj = (species_scores or {"photos": {}})["photos"].get(img.get("file"))
-        fsj_score = fsj["score"] if fsj else None
+        model_scores = {column: None for column in SPECIES_SCORE_COLUMNS}
+        results = {}
+        for label, scored in species_scores.items():
+            result = scored["photos"].get(img.get("file"))
+            if result and label in column_of:
+                model_scores[column_of[label]] = round(result["score"], 4)
+                results[label] = (result["score"], result["count"], scored["threshold"], scored["review_below"])
         fsj_possible = 0
-        if fsj and fsj_score >= species_scores["threshold"]:
-            ai_species, ai_conf, ai_count = SPECIES_MODEL_LABEL, fsj_score, fsj["count"]
-            fsj_possible = int(fsj_score < species_scores["review_below"])
+        call = species_model_call(results)
+        if call:
+            ai_species, ai_conf, ai_count, fsj_possible = call
         meta = cuddeback_exif.read_photo_metadata(path)
         has_thumb = make_thumbnail(path, image_id)
 
@@ -794,7 +836,7 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
         camelot = camelot_fields(filename, ai_species, ai_is_group, sightings)
         cols = ("id", "job_id", "folder", "filename", "stem", "position", *exif_cols,
                 "captured_at", "time_source", "diel_period", "ai_species", "ai_is_group", "ai_conf", "ai_det_conf",
-                "speciesnet_species", "fsj_score", "fsj_possible",
+                "speciesnet_species", *SPECIES_SCORE_COLUMNS, "fsj_possible",
                 "camelot_species", "camelot_agreement", "band_id",
                 "display_species", "count", "has_thumbnail", "created_at")
         values = (image_id, job_id, str(folder), filename, photo_stem(filename), position_for(filename, positions),
@@ -802,14 +844,14 @@ def sync_batch(job_id, folder, predictions_file, positions, sightings, log):
                   captured_at, time_source, compute_diel_period(captured_at), ai_species, ai_is_group,
                   round(ai_conf, 3) if ai_conf is not None else None,
                   round(ai_det_conf, 3) if ai_det_conf is not None else None,
-                  speciesnet_species, round(fsj_score, 4) if fsj_score is not None else None, fsj_possible,
+                  speciesnet_species, *model_scores.values(), fsj_possible,
                   camelot["camelot_species"], camelot["camelot_agreement"], camelot["jay_ids"],
                   display, ai_count, int(has_thumb), now_iso())
         # On reprocessing, refresh machine-derived fields only; human edits
         # (corrections, count, notes, band ID, review flag) are left alone.
         # A photo SpeciesNet is seeing for the first time has no real count yet.
         refresh = (*exif_cols, "captured_at", "time_source", "diel_period", "ai_species", "ai_is_group",
-                   "ai_conf", "ai_det_conf", "speciesnet_species", "fsj_score", "fsj_possible",
+                   "ai_conf", "ai_det_conf", "speciesnet_species", *SPECIES_SCORE_COLUMNS, "fsj_possible",
                    "camelot_species", "camelot_agreement", "display_species", "has_thumbnail")
         with db.transaction() as conn:
             conn.execute(
@@ -845,6 +887,7 @@ def public_image(r):
     out["marked_for_review"] = bool(out["marked_for_review"])
     out["metadata_edited"] = bool(out["metadata_edited"])
     out["has_thumbnail"] = bool(out["has_thumbnail"])
+    out["model_scores"] = {m["label"]: r.get(m["column"]) for m in SPECIES_MODELS if r.get(m["column"]) is not None}
     return out
 
 
